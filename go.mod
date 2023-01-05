@@ -1,3 +1,3 @@
-module mattb.net.nz/util
+module mattb.nz/util
 
 go 1.19
