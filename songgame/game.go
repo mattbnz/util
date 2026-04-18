@@ -6,6 +6,13 @@ import (
 	"time"
 )
 
+// Timings for the round lifecycle. Grace runs after 50% of players answer;
+// results period runs after the round ends before auto-advancing.
+const (
+	graceDuration   = 30 * time.Second
+	resultsDuration = 30 * time.Second
+)
+
 type Player struct {
 	ID       string    `json:"id"`
 	Name     string    `json:"name"`
@@ -24,12 +31,14 @@ type Answer struct {
 }
 
 type Round struct {
-	Number    int
-	Track     SpotifyTrack
-	Answers   map[string]*Answer
-	StartedAt time.Time
-	Ended     bool
-	EndedAt   time.Time
+	Number        int
+	Track         SpotifyTrack
+	Answers       map[string]*Answer
+	StartedAt     time.Time
+	GraceUntil    time.Time // non-zero once 50% have answered; round closes at this time
+	Ended         bool
+	EndedAt       time.Time
+	AutoAdvanceAt time.Time // set on end; next round auto-starts at this time
 }
 
 type Game struct {
@@ -39,12 +48,27 @@ type Game struct {
 	Players map[string]*Player
 	Number  int
 
+	graceTimer       *time.Timer
+	autoAdvanceTimer *time.Timer
+	onRoundEnd       func()
+	onAutoAdvance    func()
+
 	playerSubs sync.Map
 	adminSubs  sync.Map
 }
 
 func NewGame() *Game {
 	return &Game{Players: make(map[string]*Player)}
+}
+
+// SetCallbacks registers hooks for round lifecycle. onRoundEnd runs (in a
+// goroutine) immediately after a round ends; onAutoAdvance fires after the
+// results period elapses, unless cancelled by a manual start.
+func (g *Game) SetCallbacks(onRoundEnd, onAutoAdvance func()) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.onRoundEnd = onRoundEnd
+	g.onAutoAdvance = onAutoAdvance
 }
 
 // --- subscription plumbing ---
@@ -127,10 +151,15 @@ func (g *Game) CurrentTrackURI() string {
 	return g.Round.Track.URI
 }
 
-// StartRound opens a new round for the given track.
+// StartRound opens a new round for the given track. Cancels any pending
+// auto-advance so a manual start beats the timer cleanly.
 func (g *Game) StartRound(track SpotifyTrack) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.autoAdvanceTimer != nil {
+		g.autoAdvanceTimer.Stop()
+		g.autoAdvanceTimer = nil
+	}
 	g.Number++
 	g.Round = &Round{
 		Number:    g.Number,
@@ -141,7 +170,19 @@ func (g *Game) StartRound(track SpotifyTrack) {
 	go g.notify()
 }
 
-// SubmitAnswer records a player's guess. Returns roundClosed=true if this submission ended the round.
+// CancelAutoAdvance stops any pending auto-advance timer. Used when the admin
+// manually starts the next round during the results period.
+func (g *Game) CancelAutoAdvance() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.autoAdvanceTimer != nil {
+		g.autoAdvanceTimer.Stop()
+		g.autoAdvanceTimer = nil
+	}
+}
+
+// SubmitAnswer records a player's guess. Returns roundClosed=true if this
+// submission ended the round outright (everyone has now answered).
 func (g *Game) SubmitAnswer(playerID, songGuess, artistGuess string) bool {
 	g.mu.Lock()
 	if g.Round == nil || g.Round.Ended {
@@ -168,17 +209,25 @@ func (g *Game) SubmitAnswer(playerID, songGuess, artistGuess string) bool {
 		ArtistCorrect: artistOK,
 		SubmittedAt:   time.Now(),
 	}
+	answered := len(g.Round.Answers)
+	total := len(g.Players)
 	closed := false
-	if len(g.Round.Answers)*2 >= len(g.Players) && len(g.Players) > 0 {
+	switch {
+	case total > 0 && answered >= total:
+		// everyone has answered — close immediately
 		g.endRoundLocked()
 		closed = true
+	case total > 0 && answered*2 >= total && g.Round.GraceUntil.IsZero():
+		// first time we've hit 50% — start grace period
+		g.Round.GraceUntil = time.Now().Add(graceDuration)
+		g.graceTimer = time.AfterFunc(graceDuration, g.endRoundByTimer)
 	}
 	g.mu.Unlock()
 	go g.notify()
 	return closed
 }
 
-// EndRound closes the active round immediately. Returns true if a round was ended.
+// EndRound closes the active round immediately (used by admin "end now").
 func (g *Game) EndRound() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -190,10 +239,26 @@ func (g *Game) EndRound() bool {
 	return true
 }
 
+func (g *Game) endRoundByTimer() {
+	g.mu.Lock()
+	if g.Round == nil || g.Round.Ended {
+		g.mu.Unlock()
+		return
+	}
+	g.endRoundLocked()
+	g.mu.Unlock()
+	go g.notify()
+}
+
 // must be called with g.mu held
 func (g *Game) endRoundLocked() {
+	if g.graceTimer != nil {
+		g.graceTimer.Stop()
+		g.graceTimer = nil
+	}
 	g.Round.Ended = true
 	g.Round.EndedAt = time.Now()
+	g.Round.AutoAdvanceAt = time.Now().Add(resultsDuration)
 	for _, ans := range g.Round.Answers {
 		p := g.Players[ans.PlayerID]
 		if p == nil {
@@ -206,25 +271,33 @@ func (g *Game) endRoundLocked() {
 			p.Score++
 		}
 	}
+	if g.onAutoAdvance != nil {
+		g.autoAdvanceTimer = time.AfterFunc(resultsDuration, g.onAutoAdvance)
+	}
+	if g.onRoundEnd != nil {
+		go g.onRoundEnd()
+	}
 }
 
 // --- state snapshots for rendering/SSE ---
 
 type PlayerView struct {
-	RoundNumber     int       `json:"round_number"`
-	RoundActive     bool      `json:"round_active"`
-	RoundEnded      bool      `json:"round_ended"`
-	HasAnswered     bool      `json:"has_answered"`
-	YourSongOK      bool      `json:"your_song_ok"`
-	YourArtistOK    bool      `json:"your_artist_ok"`
-	YourSongGuess   string    `json:"your_song_guess"`
-	YourArtistGuess string    `json:"your_artist_guess"`
-	AnswerCount     int       `json:"answer_count"`
-	PlayerCount     int       `json:"player_count"`
-	RevealSong      string    `json:"reveal_song,omitempty"`
-	RevealArtists   string    `json:"reveal_artists,omitempty"`
-	Scoreboard      []*Player `json:"scoreboard"`
-	You             *Player   `json:"you"`
+	RoundNumber      int       `json:"round_number"`
+	RoundActive      bool      `json:"round_active"`
+	RoundEnded       bool      `json:"round_ended"`
+	HasAnswered      bool      `json:"has_answered"`
+	YourSongOK       bool      `json:"your_song_ok"`
+	YourArtistOK     bool      `json:"your_artist_ok"`
+	YourSongGuess    string    `json:"your_song_guess"`
+	YourArtistGuess  string    `json:"your_artist_guess"`
+	AnswerCount      int       `json:"answer_count"`
+	PlayerCount      int       `json:"player_count"`
+	GraceUntilUnix   int64     `json:"grace_until,omitempty"`
+	AutoAdvanceUnix  int64     `json:"auto_advance_at,omitempty"`
+	RevealSong       string    `json:"reveal_song,omitempty"`
+	RevealArtists    string    `json:"reveal_artists,omitempty"`
+	Scoreboard       []*Player `json:"scoreboard"`
+	You              *Player   `json:"you"`
 }
 
 func (g *Game) PlayerView(playerID string) PlayerView {
@@ -239,6 +312,12 @@ func (g *Game) PlayerView(playerID string) PlayerView {
 		v.RoundActive = !g.Round.Ended
 		v.RoundEnded = g.Round.Ended
 		v.AnswerCount = len(g.Round.Answers)
+		if !g.Round.GraceUntil.IsZero() && !g.Round.Ended {
+			v.GraceUntilUnix = g.Round.GraceUntil.Unix()
+		}
+		if !g.Round.AutoAdvanceAt.IsZero() && g.Round.Ended {
+			v.AutoAdvanceUnix = g.Round.AutoAdvanceAt.Unix()
+		}
 		if ans, ok := g.Round.Answers[playerID]; ok {
 			v.HasAnswered = true
 			v.YourSongGuess = ans.SongGuess
@@ -258,16 +337,18 @@ func (g *Game) PlayerView(playerID string) PlayerView {
 }
 
 type AdminView struct {
-	Authorized     bool      `json:"authorized"`
-	RoundNumber    int       `json:"round_number"`
-	RoundActive    bool      `json:"round_active"`
-	RoundEnded     bool      `json:"round_ended"`
-	CurrentSong    string    `json:"current_song"`
-	CurrentArtists string    `json:"current_artists"`
-	AnswerCount    int       `json:"answer_count"`
-	PlayerCount    int       `json:"player_count"`
-	Answers        []*Answer `json:"answers"`
-	Scoreboard     []*Player `json:"scoreboard"`
+	Authorized      bool      `json:"authorized"`
+	RoundNumber     int       `json:"round_number"`
+	RoundActive     bool      `json:"round_active"`
+	RoundEnded      bool      `json:"round_ended"`
+	CurrentSong     string    `json:"current_song"`
+	CurrentArtists  string    `json:"current_artists"`
+	AnswerCount     int       `json:"answer_count"`
+	PlayerCount     int       `json:"player_count"`
+	GraceUntilUnix  int64     `json:"grace_until,omitempty"`
+	AutoAdvanceUnix int64     `json:"auto_advance_at,omitempty"`
+	Answers         []*Answer `json:"answers"`
+	Scoreboard      []*Player `json:"scoreboard"`
 }
 
 func (g *Game) AdminView() AdminView {
@@ -281,6 +362,12 @@ func (g *Game) AdminView() AdminView {
 		v.CurrentSong = g.Round.Track.Name
 		v.CurrentArtists = joinArtists(g.Round.Track.ArtistNames())
 		v.AnswerCount = len(g.Round.Answers)
+		if !g.Round.GraceUntil.IsZero() && !g.Round.Ended {
+			v.GraceUntilUnix = g.Round.GraceUntil.Unix()
+		}
+		if !g.Round.AutoAdvanceAt.IsZero() && g.Round.Ended {
+			v.AutoAdvanceUnix = g.Round.AutoAdvanceAt.Unix()
+		}
 		v.Answers = make([]*Answer, 0, len(g.Round.Answers))
 		for _, a := range g.Round.Answers {
 			v.Answers = append(v.Answers, a)

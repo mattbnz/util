@@ -24,6 +24,10 @@ type ServerConfig struct {
 	RedirectURI  string
 }
 
+// Volume to drop to during the results period. 30% is a "background" level
+// on most devices — still audible, but quiet enough to talk over.
+const duckedPercent = 30
+
 type Server struct {
 	cfg     ServerConfig
 	spotify *SpotifyClient
@@ -33,6 +37,9 @@ type Server struct {
 	mu         sync.Mutex
 	oauthState string
 	adminToken string
+
+	volMu          sync.Mutex
+	preDuckVolume  int // 0 = not ducked; otherwise the volume we should restore to
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -48,7 +55,50 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	s.adminToken = randomHex(16)
 	log.Printf("admin token (auto-set on first visit): %s", s.adminToken)
+	s.game.SetCallbacks(s.onRoundEnd, s.onAutoAdvance)
 	return s
+}
+
+func (s *Server) onRoundEnd() {
+	s.duckVolume()
+}
+
+func (s *Server) onAutoAdvance() {
+	if err := s.advanceToNextRound(); err != nil {
+		log.Printf("auto-advance: %v", err)
+	}
+}
+
+func (s *Server) duckVolume() {
+	s.volMu.Lock()
+	defer s.volMu.Unlock()
+	if s.preDuckVolume > 0 {
+		return // already ducked
+	}
+	vol, err := s.spotify.DeviceVolume()
+	if err != nil || vol < 0 {
+		return
+	}
+	if vol <= duckedPercent {
+		return // already quiet enough
+	}
+	if err := s.spotify.SetVolume(duckedPercent); err != nil {
+		log.Printf("duck volume: %v", err)
+		return
+	}
+	s.preDuckVolume = vol
+}
+
+func (s *Server) unduckVolume() {
+	s.volMu.Lock()
+	defer s.volMu.Unlock()
+	if s.preDuckVolume == 0 {
+		return
+	}
+	if err := s.spotify.SetVolume(s.preDuckVolume); err != nil {
+		log.Printf("restore volume: %v", err)
+	}
+	s.preDuckVolume = 0
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -140,12 +190,7 @@ func (s *Server) handleAnswer(w http.ResponseWriter, r *http.Request) {
 	}
 	song := strings.TrimSpace(r.FormValue("song"))
 	artist := strings.TrimSpace(r.FormValue("artist"))
-	if s.game.SubmitAnswer(id, song, artist) {
-		// Round just closed — pause playback so admin can reveal.
-		if err := s.spotify.Pause(); err != nil {
-			log.Printf("spotify pause: %v", err)
-		}
-	}
+	s.game.SubmitAnswer(id, song, artist)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -251,21 +296,37 @@ func (s *Server) handleStartRound(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-
-	// On rounds 2+, skip to the next track first so the song is fresh.
-	if s.game.HasPreviousRound() {
-		if err := s.spotify.Next(); err != nil {
-			s.adminError(w, r, "Couldn't skip to the next song: "+err.Error()+" — make sure Spotify is open and playing on a device.")
-			return
-		}
-	}
-	// Make sure playback is actually running.
-	if err := s.spotify.Play(); err != nil {
-		s.adminError(w, r, "Couldn't start playback: "+err.Error()+" — open Spotify, start your playlist (shuffle recommended), then try again.")
+	s.game.CancelAutoAdvance()
+	if err := s.advanceToNextRound(); err != nil {
+		s.adminError(w, r, err.Error())
 		return
 	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
 
-	// Poll currently-playing until we see a track that isn't the previous one.
+func (s *Server) handleEndRound(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) || r.Method != http.MethodPost {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	s.game.EndRound() // callbacks handle ducking playback
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+// advanceToNextRound un-ducks volume, skips to the next track (if a previous
+// round exists), resumes playback, polls for the new currently-playing track,
+// and opens a new round. Shared by the manual start handler and the
+// auto-advance timer callback.
+func (s *Server) advanceToNextRound() error {
+	s.unduckVolume()
+	if s.game.HasPreviousRound() {
+		if err := s.spotify.Next(); err != nil {
+			return fmt.Errorf("couldn't skip to the next song: %v — make sure Spotify is open and playing on a device", err)
+		}
+	}
+	if err := s.spotify.Play(); err != nil {
+		return fmt.Errorf("couldn't start playback: %v — open Spotify, start your playlist (shuffle recommended), then try again", err)
+	}
 	prevURI := s.game.CurrentTrackURI()
 	var track *SpotifyTrack
 	deadline := time.Now().Add(4 * time.Second)
@@ -278,24 +339,10 @@ func (s *Server) handleStartRound(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(400 * time.Millisecond)
 	}
 	if track == nil {
-		s.adminError(w, r, "Spotify didn't report a track playing within a few seconds. Make sure a playlist is playing on your phone (or another device) and try again.")
-		return
+		return fmt.Errorf("Spotify didn't report a track playing within a few seconds — make sure a playlist is playing on your phone (or another device) and try again")
 	}
-
 	s.game.StartRound(*track)
-	http.Redirect(w, r, "/admin", http.StatusSeeOther)
-}
-
-func (s *Server) handleEndRound(w http.ResponseWriter, r *http.Request) {
-	if !s.isAdmin(r) || r.Method != http.MethodPost {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	s.game.EndRound()
-	if err := s.spotify.Pause(); err != nil {
-		log.Printf("spotify pause: %v", err)
-	}
-	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+	return nil
 }
 
 func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {

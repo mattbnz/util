@@ -14,10 +14,16 @@ server just reads what's playing and does play / pause / skip between rounds.
 - **You** open `/admin`, log in with Spotify once, and click "Start next
   round". The server calls *skip → resume → read currently-playing*, records
   the track as the round's answer, and opens guessing for the players.
-- Players submit song + artist guesses. The round ends once half the players
-  have answered (or you click "End round now"). The server pauses playback and
-  reveals the answer. Scoring: 1 point for the correct song, 1 for the artist.
-- Click "Start next round" again — skip, resume, repeat.
+- Players submit song + artist guesses. Once half have answered, a **30-second
+  grace period** starts so the slower half can still guess. The round ends
+  when the grace period expires, everyone has answered, or you click "End
+  round now".
+- When the round ends, the server **ducks Spotify's volume** to a background
+  level (the song keeps playing) and reveals the answer. **30 seconds later
+  the next round auto-starts** — volume is restored, Spotify skips to a new
+  track, and a fresh round opens. You can also click "Start next round" to
+  skip the results countdown.
+- Scoring: 1 point for the correct song, 1 for the artist.
 - The player page **never** shows the currently-playing song or artist. The
   answer is only visible on `/admin`. Keep Spotify out of sight of players.
 
@@ -76,3 +82,6 @@ matching any one artist of a multi-artist track is enough.
 - If Spotify isn't actively playing when you click "Start next round", the
   skip/play call fails — the admin page will show the error, and you just
   need to nudge play on your phone and try again.
+- Volume ducking relies on Spotify Connect volume control, which doesn't work
+  on every device (Bluetooth speakers in particular may ignore it). If it
+  silently fails, the song just keeps playing at normal volume during results.

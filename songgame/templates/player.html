@@ -24,6 +24,9 @@
   .mark-ok { color: #1db954; font-weight: 600; }
   .mark-no { color: #c33; }
   .count { color: #666; font-size: 0.9rem; }
+  .countdown { display: inline-block; margin-top: 0.5rem; padding: 0.3rem 0.6rem; background: #fdecea; color: #a22; border-radius: 4px; font-weight: 600; font-size: 0.95rem; }
+  .countdown.results { background: #e7f3fe; color: #14518b; }
+  .countdown[hidden] { display: none; }
 </style>
 </head>
 <body>
@@ -44,6 +47,9 @@
         </form>
         <p class="count">{{.AnswerCount}} of {{.PlayerCount}} players answered so far</p>
       {{end}}
+      <div id="grace" class="countdown" data-deadline="{{.GraceUntilUnix}}" {{if not .GraceUntilUnix}}hidden{{end}}>
+        Hurry! <span class="secs">—</span>s until the round auto-ends
+      </div>
     {{else if .RoundEnded}}
       <div class="status reveal">Round {{.RoundNumber}} ended</div>
       <p>The song was <strong>{{.RevealSong}}</strong> by <strong>{{.RevealArtists}}</strong>.</p>
@@ -54,7 +60,9 @@
       {{else}}
         <p>You didn't answer in time.</p>
       {{end}}
-      <p class="waiting">Waiting for the next round…</p>
+      <div id="advance" class="countdown results" data-deadline="{{.AutoAdvanceUnix}}" {{if not .AutoAdvanceUnix}}hidden{{end}}>
+        Next round in <span class="secs">—</span>s
+      </div>
     {{else}}
       <div class="status waiting">Waiting for the host to start a round…</div>
     {{end}}
@@ -75,17 +83,52 @@
 <script>
 (function(){
   var last = null;
+
+  function setDeadline(id, unix) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    if (unix && unix > 0) {
+      el.dataset.deadline = String(unix);
+      el.hidden = false;
+    } else {
+      el.dataset.deadline = "0";
+      el.hidden = true;
+    }
+  }
+
+  function tick() {
+    document.querySelectorAll('.countdown').forEach(function(el){
+      if (el.hidden) return;
+      var t = parseInt(el.dataset.deadline, 10);
+      if (!t) return;
+      var sec = Math.max(0, t - Math.floor(Date.now()/1000));
+      var span = el.querySelector('.secs');
+      if (span) span.textContent = sec;
+    });
+  }
+  tick();
+  setInterval(tick, 1000);
+
   var es = new EventSource("/events");
   es.onmessage = function(e){
     try {
       var v = JSON.parse(e.data);
       if (last === null) { last = v; return; }
-      // Only reload when round state changes — avoids wiping a half-typed answer
-      // whenever someone else submits.
+      // Full reload only when the round flips to a new state — avoids wiping
+      // a half-typed answer whenever someone else submits.
       if (v.round_number !== last.round_number ||
           v.round_active !== last.round_active ||
           v.round_ended  !== last.round_ended) {
         location.reload();
+        return;
+      }
+      // In-place update of countdown deadlines so the grace period banner
+      // can appear mid-round without reload.
+      if (v.grace_until !== last.grace_until) {
+        setDeadline('grace', v.grace_until);
+      }
+      if (v.auto_advance_at !== last.auto_advance_at) {
+        setDeadline('advance', v.auto_advance_at);
       }
       last = v;
     } catch (err) { /* ignore */ }

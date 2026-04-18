@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -241,4 +242,51 @@ func (s *SpotifyClient) Pause() error {
 		return nil
 	}
 	return err
+}
+
+// DeviceVolume returns the active device's volume (0-100), or -1 if unknown.
+func (s *SpotifyClient) DeviceVolume() (int, error) {
+	if err := s.refreshIfNeeded(); err != nil {
+		return -1, err
+	}
+	req, _ := http.NewRequest("GET", "https://api.spotify.com/v1/me/player", nil)
+	s.mu.Lock()
+	req.Header.Set("Authorization", "Bearer "+s.accessToken)
+	s.mu.Unlock()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return -1, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 204 {
+		return -1, nil // nothing playing
+	}
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return -1, fmt.Errorf("player: %d %s", resp.StatusCode, data)
+	}
+	var pb struct {
+		Device *struct {
+			VolumePercent int `json:"volume_percent"`
+		} `json:"device"`
+	}
+	if err := json.Unmarshal(data, &pb); err != nil {
+		return -1, err
+	}
+	if pb.Device == nil {
+		return -1, nil
+	}
+	return pb.Device.VolumePercent, nil
+}
+
+// SetVolume sets the active device's volume (0-100). Not all devices support
+// this — Bluetooth speakers in particular may reject it.
+func (s *SpotifyClient) SetVolume(pct int) error {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return s.do("PUT", "/me/player/volume?volume_percent="+strconv.Itoa(pct), nil, nil)
 }
