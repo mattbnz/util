@@ -142,9 +142,32 @@
 
 <script>
 (function(){
+  var last = null;
   var es = new EventSource("/admin/events");
-  es.onmessage = function(){ location.reload(); };
-  es.onerror = function(){ setTimeout(function(){ location.reload(); }, 3000); };
+  es.onmessage = function(e){
+    try {
+      var v = JSON.parse(e.data);
+      if (last === null) { last = v; return; }
+      // Only reload on state transitions that affect the whole page — avoids
+      // infinite loops on the initial snapshot and stops the page reloading
+      // out from under a dropdown while the admin is mid-click.
+      var changed = (v.round_number !== last.round_number ||
+                     v.round_active !== last.round_active ||
+                     v.round_ended  !== last.round_ended  ||
+                     v.authorized   !== last.authorized   ||
+                     v.playlist_id  !== last.playlist_id  ||
+                     v.device_id    !== last.device_id    ||
+                     v.player_count !== last.player_count ||
+                     v.answer_count !== last.answer_count);
+      last = v;
+      if (!changed) return;
+      // Don't yank focus from a form the admin is interacting with.
+      var ae = document.activeElement;
+      if (ae && (ae.tagName === "SELECT" || ae.tagName === "INPUT" || ae.tagName === "BUTTON")) return;
+      location.reload();
+    } catch (err) { /* ignore */ }
+  };
+  es.onerror = function(){ setTimeout(function(){ if (last === null) location.reload(); }, 5000); };
 })();
 </script>
 </body>
