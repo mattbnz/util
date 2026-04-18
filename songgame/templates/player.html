@@ -126,6 +126,40 @@
       var span = el.querySelector('.secs');
       if (span) span.textContent = sec;
     });
+    maybeAutoSubmit();
+  }
+
+  // If the grace period is about to expire and we have any text in the
+  // answer form, submit it on the player's behalf so a half-typed guess
+  // still counts. Fires once, a couple of seconds before the server-side
+  // deadline to cover network delay.
+  var autoSubmitted = false;
+  function maybeAutoSubmit() {
+    if (autoSubmitted) return;
+    var grace = document.getElementById('grace');
+    if (!grace || grace.hidden) return;
+    var t = parseInt(grace.dataset.deadline, 10);
+    if (!t) return;
+    var remaining = t - Math.floor(Date.now()/1000);
+    if (remaining > 2) return;
+    var form = document.querySelector('form[action="/answer"]');
+    if (!form) return;
+    var song = form.querySelector('[name=song]');
+    var artist = form.querySelector('[name=artist]');
+    var songVal = song ? song.value.trim() : '';
+    var artistVal = artist ? artist.value.trim() : '';
+    if (!songVal && !artistVal) return; // nothing typed — leave it blank
+    autoSubmitted = true;
+    // Strip required so the browser doesn't block an only-one-field submit.
+    if (song) song.removeAttribute('required');
+    if (artist) artist.removeAttribute('required');
+    form.querySelectorAll('input, button').forEach(function(el){ el.disabled = true; });
+    var note = document.createElement('p');
+    note.className = 'count';
+    note.style.color = '#a22';
+    note.textContent = 'Time! Submitting what you had…';
+    form.appendChild(note);
+    form.submit();
   }
   tick();
   setInterval(tick, 1000);
