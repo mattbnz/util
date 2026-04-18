@@ -401,14 +401,16 @@ func (s *Server) handleStartRound(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
-// Playback poller cadences. In-sync polling is deliberately slow to keep
-// /me/player call volume low; mismatch ramps up briefly to confirm/resolve.
-// Idle is a long sleep — any round start wakes the loop immediately via
-// PokePlaybackPoller.
+// Playback poller cadences.
+//   - prep: fast polling to confirm the skip / first-round currently-playing
+//     as soon as possible; caps at prepTimeout before giving up.
+//   - active in sync: slow polling just to detect drift.
+//   - idle: long sleep; PokePlaybackPoller wakes the loop when state changes.
 const (
-	pollInSync    = 30 * time.Second
-	pollMismatch  = 5 * time.Second
-	pollIdle      = 5 * time.Minute
+	pollPrep    = 700 * time.Millisecond
+	pollInSync  = 30 * time.Second
+	pollIdle    = 5 * time.Minute
+	prepTimeout = 20 * time.Second
 )
 
 // PokePlaybackPoller asks the poller to run its next cycle immediately
@@ -430,20 +432,14 @@ func (s *Server) LastPlaybackStatus() (*PlaybackStatus, time.Time, error) {
 }
 
 // RunPlaybackPoller is the single source of /me/player traffic. It caches the
-// last status for the admin UI to read without hammering Spotify, and folds
-// the auto-resync logic into the same loop — if Spotify reports a different
-// track than the active round across two consecutive cycles, UpdateRoundTrack
-// is called. Cadence is adaptive:
-//
-//   - idle (no active round or not authorised): long sleep, no API calls
-//   - in sync: pollInSync
-//   - mismatch observed: pollMismatch until confirmed or resolved
+// last status for the admin UI to read, drives the prep→active transition
+// when a round is being set up, and fires immediate resyncs when an active
+// round drifts from what Spotify is playing. Cadence adapts to the current
+// phase (see pollPrep / pollInSync / pollIdle constants).
 //
 // Blocks until stop is closed.
 func (s *Server) RunPlaybackPoller(stop <-chan struct{}) {
 	interval := pollInSync
-	var mismatchURI string
-	var mismatchCount int
 	for {
 		select {
 		case <-stop:
@@ -451,10 +447,13 @@ func (s *Server) RunPlaybackPoller(stop <-chan struct{}) {
 		case <-time.After(interval):
 		case <-s.wakePoller:
 		}
-		if !s.spotify.Authorized() || !s.game.HasActiveRound() {
+		if !s.spotify.Authorized() {
 			interval = pollIdle
-			mismatchURI = ""
-			mismatchCount = 0
+			continue
+		}
+		phase := s.game.RoundPhase()
+		if phase == "" || phase == PhaseEnded {
+			interval = pollIdle
 			continue
 		}
 		st, err := s.spotify.PlaybackStatus()
@@ -462,37 +461,63 @@ func (s *Server) RunPlaybackPoller(stop <-chan struct{}) {
 		s.cache = playbackCache{status: st, err: err, polledAt: time.Now()}
 		s.cacheMu.Unlock()
 		if err != nil {
-			interval = pollInSync // don't hammer; try again on normal cadence
+			// transient network / API hiccup — back off briefly and retry
+			interval = pollPrep
 			continue
 		}
-		expected := s.game.CurrentTrackURI()
-		if st == nil || st.Raw204 || st.TrackURI == "" || st.TrackURI == expected {
+		switch phase {
+		case PhasePrep:
+			interval = pollPrep
+			if st == nil || st.Raw204 || st.TrackURI == "" {
+				// nothing playing yet — if we've been trying too long, give up
+				if s.prepTimedOut() {
+					s.game.CancelPrepRound()
+					log.Printf("prep: gave up waiting for Spotify to report a track")
+					interval = pollIdle
+				}
+				continue
+			}
+			prev := s.game.PrepPrevURI()
+			if prev != "" && st.TrackURI == prev {
+				// skip hasn't taken effect yet; keep waiting
+				if s.prepTimedOut() {
+					s.game.CancelPrepRound()
+					log.Printf("prep: gave up — skip didn't take effect within %s", prepTimeout)
+					interval = pollIdle
+				}
+				continue
+			}
+			// Got a fresh track — activate.
+			if track, ok := st.AsTrack(); ok {
+				s.game.ActivateRound(track)
+				log.Printf("prep→active: %q by %v", track.Name, track.ArtistNames())
+				interval = pollInSync
+			}
+		case PhaseActive:
 			interval = pollInSync
-			mismatchURI = ""
-			mismatchCount = 0
-			continue
-		}
-		// Mismatch observed — require two consecutive sightings of the same
-		// wrong URI before resyncing, to ride out the brief staleness the API
-		// reports right after a skip.
-		if mismatchURI == st.TrackURI {
-			mismatchCount++
-		} else {
-			mismatchURI = st.TrackURI
-			mismatchCount = 1
-		}
-		interval = pollMismatch
-		if mismatchCount >= 2 {
+			expected := s.game.CurrentTrackURI()
+			if st == nil || st.Raw204 || st.TrackURI == "" || st.TrackURI == expected {
+				continue
+			}
+			// Immediate resync — user asked for no delay.
 			if track, ok := st.AsTrack(); ok {
 				if s.game.UpdateRoundTrack(track) {
 					log.Printf("auto-resync: round track updated to %q by %v", track.Name, track.ArtistNames())
 				}
 			}
-			mismatchURI = ""
-			mismatchCount = 0
-			interval = pollInSync
 		}
 	}
+}
+
+// prepTimedOut reports whether the current prep round has been waiting for
+// Spotify longer than prepTimeout. Returns false if no prep round is active.
+func (s *Server) prepTimedOut() bool {
+	s.game.mu.Lock()
+	defer s.game.mu.Unlock()
+	if s.game.Round == nil || s.game.Round.Phase != PhasePrep {
+		return false
+	}
+	return time.Since(s.game.Round.PrepStartedAt) > prepTimeout
 }
 
 func (s *Server) handleSpotifyStatus(w http.ResponseWriter, r *http.Request) {
@@ -607,13 +632,16 @@ func (s *Server) handleEndRound(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
-// advanceToNextRound un-ducks volume, skips to the next track (if a previous
-// round exists), resumes playback, polls for the new currently-playing track,
-// and opens a new round. Shared by the manual start handler and the
-// auto-advance timer callback.
+// advanceToNextRound begins the next round. It un-ducks volume, issues a skip
+// only if a previous round exists (round 1 keeps whatever is playing), starts
+// playback, and opens a prep-phase round. The playback poller then watches
+// /me/player until the track URI differs from the prev round's (or any track
+// appears for round 1) and flips the round to active. Players don't see the
+// round until that transition happens.
 func (s *Server) advanceToNextRound() error {
 	s.unduckVolume()
-	if s.game.HasPreviousRound() {
+	prevURI := s.game.CurrentTrackURI() // non-empty only if a completed round is still around
+	if prevURI != "" {
 		if err := s.spotify.Next(); err != nil {
 			return fmt.Errorf("couldn't skip to the next song: %v — make sure Spotify is open and playing on a device", err)
 		}
@@ -621,23 +649,7 @@ func (s *Server) advanceToNextRound() error {
 	if err := s.spotify.Play(); err != nil {
 		return fmt.Errorf("couldn't start playback: %v — open Spotify, start your playlist (shuffle recommended), then try again", err)
 	}
-	prevURI := s.game.CurrentTrackURI()
-	var track *SpotifyTrack
-	deadline := time.Now().Add(4 * time.Second)
-	for time.Now().Before(deadline) {
-		cp, err := s.spotify.CurrentlyPlaying()
-		if err == nil && cp != nil && cp.Item != nil && cp.Item.URI != "" && cp.Item.URI != prevURI {
-			track = cp.Item
-			break
-		}
-		time.Sleep(400 * time.Millisecond)
-	}
-	if track == nil {
-		return fmt.Errorf("Spotify didn't report a track playing within a few seconds — make sure a playlist is playing on your phone (or another device) and try again")
-	}
-	s.game.StartRound(*track)
-	// Wake the playback poller so the in-sync status cache refreshes promptly
-	// (the poller would otherwise be on a long idle interval).
+	s.game.BeginPrepRound(prevURI)
 	s.PokePlaybackPoller()
 	return nil
 }

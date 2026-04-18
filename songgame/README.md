@@ -108,13 +108,18 @@ round was opened), the admin page has tools to recover:
   and shows the active device, volume, play/pause state, shuffle flag, and
   the track Spotify *thinks* is playing with progress. If that track doesn't
   match the round's expected track you'll see a red mismatch warning.
-- The server runs a single adaptive playback poller that doubles as the
-  auto-resync mechanism. Cadence: idle (no calls to `/me/player`) when no
-  round is active, every 30 s when the round is in sync with Spotify, every
-  5 s when a mismatch is observed until resolved. If a different track is
-  reported for two consecutive polls (≈10 s of drift) the round's answer is
-  swapped to the actually-playing track and every submitted guess is
-  re-graded. New rounds wake the poller immediately.
+- Rounds follow an explicit three-phase lifecycle:
+  1. **Prep**: the admin kicked off a new round; the server has issued
+     skip/play and is polling Spotify at ~1 Hz until currently-playing
+     confirms a fresh track. Players see "Getting round N ready…" and no
+     guessing form. Round 1 doesn't issue a skip — prep just captures
+     whatever's playing.
+  2. **Active**: confirmed track, players see the form, grace period logic
+     applies. The poller drops to every 30 s but resyncs *immediately* on
+     any mismatch (no two-poll delay).
+  3. **Ended**: reveal shown, volume ducked, auto-advance timer runs; when
+     it fires, the server skips and the next prep begins.
+  No player display ever shows a round the server isn't sure about.
 - The **Resync with Spotify** button forces the same reconciliation on
   demand — use it if you don't want to wait for auto-resync to kick in.
 - Every Spotify API call is logged with method, path, status code, and

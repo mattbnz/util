@@ -33,15 +33,24 @@ type Answer struct {
 	SubmittedAt   time.Time `json:"-"`
 }
 
+const (
+	PhasePrep   = "prep"
+	PhaseActive = "active"
+	PhaseEnded  = "ended"
+)
+
 type Round struct {
 	Number        int
+	Phase         string // prep | active | ended
 	Track         SpotifyTrack
 	Answers       map[string]*Answer
+	PrepStartedAt time.Time
+	PrepPrevURI   string // URI that was playing before; prep waits for a different URI (skipped case)
 	StartedAt     time.Time
-	GraceUntil    time.Time // non-zero once 50% have answered; round closes at this time
-	Ended         bool
+	GraceUntil    time.Time
+	Ended         bool // kept for backward-compat snapshots; = Phase==PhaseEnded
 	EndedAt       time.Time
-	AutoAdvanceAt time.Time // set on end; next round auto-starts at this time
+	AutoAdvanceAt time.Time
 }
 
 // RoundResult is the persisted snapshot of a completed round, shown below the
@@ -302,11 +311,11 @@ func (g *Game) GetPlayer(id string) *Player {
 	return g.Players[id]
 }
 
-// HasActiveRound returns true if a round is currently open.
+// HasActiveRound returns true if a round is currently active (not prep, not ended).
 func (g *Game) HasActiveRound() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.Round != nil && !g.Round.Ended
+	return g.Round != nil && g.Round.Phase == PhaseActive
 }
 
 // HasPreviousRound returns true if at least one round has been played.
@@ -332,7 +341,7 @@ func (g *Game) CurrentTrackURI() string {
 func (g *Game) UpdateRoundTrack(track SpotifyTrack) (updated bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.Round == nil || g.Round.Ended {
+	if g.Round == nil || g.Round.Phase != PhaseActive {
 		return false
 	}
 	if g.Round.Track.URI == track.URI {
@@ -347,10 +356,11 @@ func (g *Game) UpdateRoundTrack(track SpotifyTrack) (updated bool) {
 	return true
 }
 
-// StartRound opens a new round for the given track. Cancels any pending
-// auto-advance so a manual start beats the timer cleanly. Starts a fresh
-// game session (GameID/StartedAt) if none is active.
-func (g *Game) StartRound(track SpotifyTrack) {
+// BeginPrepRound creates the next round in prep phase. If prevURI is non-empty,
+// the prep phase waits for Spotify to report a different currently-playing URI
+// (i.e., a previously-issued skip took effect). An empty prevURI means "accept
+// whatever is currently playing" — used for round 1 where we don't skip.
+func (g *Game) BeginPrepRound(prevURI string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.autoAdvanceTimer != nil {
@@ -363,12 +373,85 @@ func (g *Game) StartRound(track SpotifyTrack) {
 	}
 	g.Number++
 	g.Round = &Round{
-		Number:    g.Number,
-		Track:     track,
-		Answers:   make(map[string]*Answer),
-		StartedAt: time.Now(),
+		Number:        g.Number,
+		Phase:         PhasePrep,
+		Answers:       make(map[string]*Answer),
+		PrepStartedAt: time.Now(),
+		PrepPrevURI:   prevURI,
 	}
 	go g.notify()
+}
+
+// StartRound is a convenience that opens a prep round and immediately
+// activates it with the given track. Tests mostly use this; production code
+// goes through BeginPrepRound + poller + ActivateRound.
+func (g *Game) StartRound(track SpotifyTrack) {
+	g.BeginPrepRound("")
+	g.ActivateRound(track)
+}
+
+// ActivateRound transitions the current prep round to active with the track
+// Spotify is actually playing. No-op if no round or not in prep.
+func (g *Game) ActivateRound(track SpotifyTrack) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.Round == nil || g.Round.Phase != PhasePrep {
+		return
+	}
+	g.Round.Phase = PhaseActive
+	g.Round.Track = track
+	g.Round.StartedAt = time.Now()
+	go g.notify()
+}
+
+// CancelPrepRound discards a prep round (on error or admin abort) and rewinds
+// the round counter so the next attempt keeps numbering continuous.
+func (g *Game) CancelPrepRound() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.Round == nil || g.Round.Phase != PhasePrep {
+		return false
+	}
+	g.Round = nil
+	g.Number--
+	go g.notify()
+	return true
+}
+
+// PrepPrevURI returns the URI the prep phase is waiting to differ from, or "".
+func (g *Game) PrepPrevURI() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.Round == nil || g.Round.Phase != PhasePrep {
+		return ""
+	}
+	return g.Round.PrepPrevURI
+}
+
+// RoundPhase returns the current round phase, or "" if none.
+func (g *Game) RoundPhase() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.Round == nil {
+		return ""
+	}
+	return g.Round.Phase
+}
+
+// LatestCompletedTrackURI returns the URI of the most recently completed round
+// (used by the next prep phase as the "must differ from" seed).
+func (g *Game) LatestCompletedTrackURI() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.Rounds) == 0 {
+		return ""
+	}
+	// PrevRound/Rounds don't carry the track URI, only name/artists. The
+	// authoritative URI is on the live Round if it's ended but still around.
+	if g.Round != nil && g.Round.Phase == PhaseEnded {
+		return g.Round.Track.URI
+	}
+	return ""
 }
 
 // EndGame archives the current game session to History and resets live state
@@ -378,12 +461,17 @@ func (g *Game) StartRound(track SpotifyTrack) {
 func (g *Game) EndGame() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.GameID == "" && len(g.Rounds) == 0 && (g.Round == nil || g.Round.Ended) {
+	if g.GameID == "" && len(g.Rounds) == 0 && (g.Round == nil || g.Round.Phase == PhaseEnded) {
 		return
 	}
-	// End any live round first so it counts toward the archive.
-	if g.Round != nil && !g.Round.Ended {
-		g.endRoundLocked()
+	// End any live active round first so it counts toward the archive.
+	// Prep rounds are just dropped — they never reached the players.
+	if g.Round != nil {
+		if g.Round.Phase == PhaseActive {
+			g.endRoundLocked()
+		} else if g.Round.Phase == PhasePrep {
+			g.Round = nil
+		}
 	}
 	if g.autoAdvanceTimer != nil {
 		g.autoAdvanceTimer.Stop()
@@ -449,7 +537,7 @@ func (g *Game) CancelAutoAdvance() {
 // submission ended the round outright (everyone has now answered).
 func (g *Game) SubmitAnswer(playerID, songGuess, artistGuess string) bool {
 	g.mu.Lock()
-	if g.Round == nil || g.Round.Ended {
+	if g.Round == nil || g.Round.Phase != PhaseActive {
 		g.mu.Unlock()
 		return false
 	}
@@ -495,7 +583,7 @@ func (g *Game) SubmitAnswer(playerID, songGuess, artistGuess string) bool {
 func (g *Game) EndRound() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.Round == nil || g.Round.Ended {
+	if g.Round == nil || g.Round.Phase != PhaseActive {
 		return false
 	}
 	g.endRoundLocked()
@@ -505,7 +593,7 @@ func (g *Game) EndRound() bool {
 
 func (g *Game) endRoundByTimer() {
 	g.mu.Lock()
-	if g.Round == nil || g.Round.Ended {
+	if g.Round == nil || g.Round.Phase != PhaseActive {
 		g.mu.Unlock()
 		return
 	}
@@ -520,6 +608,7 @@ func (g *Game) endRoundLocked() {
 		g.graceTimer.Stop()
 		g.graceTimer = nil
 	}
+	g.Round.Phase = PhaseEnded
 	g.Round.Ended = true
 	g.Round.EndedAt = time.Now()
 	g.Round.AutoAdvanceAt = time.Now().Add(g.resultsDuration)
@@ -563,6 +652,7 @@ func (g *Game) endRoundLocked() {
 
 type PlayerView struct {
 	RoundNumber     int           `json:"round_number"`
+	RoundPrep       bool          `json:"round_prep"`
 	RoundActive     bool          `json:"round_active"`
 	RoundEnded      bool          `json:"round_ended"`
 	HasAnswered     bool          `json:"has_answered"`
@@ -591,27 +681,25 @@ func (g *Game) PlayerView(playerID string) PlayerView {
 	}
 	if g.Round != nil {
 		v.RoundNumber = g.Round.Number
-		v.RoundActive = !g.Round.Ended
-		v.RoundEnded = g.Round.Ended
+		v.RoundPrep = g.Round.Phase == PhasePrep
+		v.RoundActive = g.Round.Phase == PhaseActive
+		v.RoundEnded = g.Round.Phase == PhaseEnded
 		v.AnswerCount = len(g.Round.Answers)
-		if !g.Round.GraceUntil.IsZero() && !g.Round.Ended {
+		if !g.Round.GraceUntil.IsZero() && v.RoundActive {
 			v.GraceUntilUnix = g.Round.GraceUntil.Unix()
 		}
-		if !g.Round.AutoAdvanceAt.IsZero() && g.Round.Ended {
+		if !g.Round.AutoAdvanceAt.IsZero() && v.RoundEnded {
 			v.AutoAdvanceUnix = g.Round.AutoAdvanceAt.Unix()
 		}
 		if ans, ok := g.Round.Answers[playerID]; ok {
 			v.HasAnswered = true
 			v.YourSongGuess = ans.SongGuess
 			v.YourArtistGuess = ans.ArtistGuess
-			if g.Round.Ended {
+			if v.RoundEnded {
 				v.YourSongOK = ans.SongCorrect
 				v.YourArtistOK = ans.ArtistCorrect
 			}
-			// Expose other players' guesses (no correctness) to this player
-			// while the round is still live — gives them something to watch
-			// and reveals nothing about the right answer.
-			if !g.Round.Ended {
+			if v.RoundActive {
 				for _, a := range g.Round.Answers {
 					v.LiveAnswers = append(v.LiveAnswers, &LiveAnswer{
 						PlayerID:    a.PlayerID,
@@ -626,7 +714,7 @@ func (g *Game) PlayerView(playerID string) PlayerView {
 				})
 			}
 		}
-		if g.Round.Ended {
+		if v.RoundEnded {
 			v.RevealSong = g.Round.Track.Name
 			v.RevealArtists = joinArtists(g.Round.Track.ArtistNames())
 		}
@@ -641,6 +729,7 @@ type AdminView struct {
 	GameID          string        `json:"game_id,omitempty"`
 	GameActive      bool          `json:"game_active"`
 	RoundNumber     int           `json:"round_number"`
+	RoundPrep       bool          `json:"round_prep"`
 	RoundActive     bool          `json:"round_active"`
 	RoundEnded      bool          `json:"round_ended"`
 	CurrentSong     string        `json:"current_song"`
@@ -661,15 +750,16 @@ func (g *Game) AdminView() AdminView {
 	v := AdminView{PlayerCount: len(g.Players)}
 	if g.Round != nil {
 		v.RoundNumber = g.Round.Number
-		v.RoundActive = !g.Round.Ended
-		v.RoundEnded = g.Round.Ended
+		v.RoundPrep = g.Round.Phase == PhasePrep
+		v.RoundActive = g.Round.Phase == PhaseActive
+		v.RoundEnded = g.Round.Phase == PhaseEnded
 		v.CurrentSong = g.Round.Track.Name
 		v.CurrentArtists = joinArtists(g.Round.Track.ArtistNames())
 		v.AnswerCount = len(g.Round.Answers)
-		if !g.Round.GraceUntil.IsZero() && !g.Round.Ended {
+		if !g.Round.GraceUntil.IsZero() && v.RoundActive {
 			v.GraceUntilUnix = g.Round.GraceUntil.Unix()
 		}
-		if !g.Round.AutoAdvanceAt.IsZero() && g.Round.Ended {
+		if !g.Round.AutoAdvanceAt.IsZero() && v.RoundEnded {
 			v.AutoAdvanceUnix = g.Round.AutoAdvanceAt.Unix()
 		}
 		v.Answers = make([]*Answer, 0, len(g.Round.Answers))

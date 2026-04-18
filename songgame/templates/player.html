@@ -34,7 +34,10 @@
   {{if .You}}<div class="you">Playing as <strong>{{.You.Name}}</strong></div>{{end}}
 
   <div class="card" id="round">
-    {{if .RoundActive}}
+    {{if .RoundPrep}}
+      <div class="status waiting">Getting round {{.RoundNumber}} ready…</div>
+      <p class="muted">Waiting for Spotify to sync. You'll see the guessing form as soon as the song is confirmed.</p>
+    {{else if .RoundActive}}
       <div class="status active">Round {{.RoundNumber}} — a song is playing!</div>
       {{if .HasAnswered}}
         <p>You answered. Waiting for others…</p>
@@ -214,6 +217,7 @@
       // Full reload only when the round flips to a new state — avoids wiping
       // a half-typed answer whenever someone else submits.
       if (v.round_number !== last.round_number ||
+          v.round_prep   !== last.round_prep   ||
           v.round_active !== last.round_active ||
           v.round_ended  !== last.round_ended) {
         location.reload();

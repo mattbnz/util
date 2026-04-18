@@ -186,6 +186,45 @@ func TestUpdateRoundTrackRefusesWhenNoActiveRound(t *testing.T) {
 	}
 }
 
+func TestBeginPrepRoundThenActivate(t *testing.T) {
+	g := NewGame()
+	g.AddOrUpdatePlayer("a", "A")
+	g.BeginPrepRound("")
+	if g.RoundPhase() != PhasePrep {
+		t.Fatalf("phase after BeginPrepRound: got %q, want prep", g.RoundPhase())
+	}
+	// Submissions during prep should be rejected.
+	if g.SubmitAnswer("a", "x", "y") {
+		t.Errorf("SubmitAnswer should return false during prep phase")
+	}
+	// Activate.
+	g.ActivateRound(track("t1", "Song", "Artist"))
+	if g.RoundPhase() != PhaseActive {
+		t.Fatalf("phase after ActivateRound: got %q, want active", g.RoundPhase())
+	}
+	// Now submissions work.
+	g.SubmitAnswer("a", "Song", "Artist")
+	v := g.AdminView()
+	if len(v.Answers) != 1 {
+		t.Errorf("expected 1 answer after activate+submit, got %d", len(v.Answers))
+	}
+}
+
+func TestCancelPrepRoundRewindsNumber(t *testing.T) {
+	g := NewGame()
+	g.BeginPrepRound("")
+	n := g.Number
+	if !g.CancelPrepRound() {
+		t.Fatalf("CancelPrepRound should succeed for a prep round")
+	}
+	if g.Number != n-1 {
+		t.Errorf("Number should rewind after cancel: got %d, want %d", g.Number, n-1)
+	}
+	if g.Round != nil {
+		t.Errorf("Round should be cleared after cancel")
+	}
+}
+
 func TestEndGameArchivesAndResets(t *testing.T) {
 	g := NewGame()
 	g.AddOrUpdatePlayer("a", "Alice")
