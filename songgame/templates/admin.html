@@ -55,6 +55,21 @@
     </div>
 
     <div class="card">
+      <h3>Settings</h3>
+      <form method="post" action="/admin/config" style="display:flex; flex-wrap:wrap; gap:1rem; align-items:flex-end;">
+        <label style="display:flex; flex-direction:column; gap:0.25rem;">
+          <span class="muted" style="font-size:0.85rem;">Grace period after 50% (seconds)</span>
+          <input type="number" name="grace_seconds" min="5" max="300" value="{{.GraceSeconds}}" style="padding:0.4rem; width:8rem;">
+        </label>
+        <label style="display:flex; flex-direction:column; gap:0.25rem;">
+          <span class="muted" style="font-size:0.85rem;">Results / auto-advance (seconds)</span>
+          <input type="number" name="results_seconds" min="5" max="300" value="{{.ResultsSeconds}}" style="padding:0.4rem; width:8rem;">
+        </label>
+        <button type="submit" class="secondary">Save</button>
+      </form>
+    </div>
+
+    <div class="card">
       <h3>Share admin access</h3>
       <p class="muted">Anyone with this link can control the game. Send it only to people you want to co-host.</p>
       <div style="display:flex; gap:0.5rem; align-items:center;">

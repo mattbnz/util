@@ -54,6 +54,22 @@ Flags:
   reach the server at e.g. `http://192.168.x.x:8080/`, run with
   `-redirect-base http://192.168.x.x:8080` **and** add that exact URI to your
   Spotify app's Redirect URIs.
+- `-state` path to the JSON state file, default `songgame-state.json`. Players,
+  scores, round number, and the configurable durations are saved on every
+  change (debounced by 2 seconds) and flushed on SIGINT/SIGTERM. Pass an empty
+  string to disable persistence. Spotify tokens are **not** persisted — log in
+  again after a restart.
+
+## Settings
+
+The admin page has a "Settings" card with two fields (5–300 seconds each):
+
+- **Grace period after 50%** — how long the slower half of players have to
+  guess once the quicker half has locked in. Default 30s.
+- **Results / auto-advance** — how long results stay on screen before the next
+  round auto-starts. Default 30s.
+
+Both are persisted in the state file, so they survive a restart.
 
 Then:
 
@@ -79,7 +95,7 @@ matching any one artist of a multi-artist track is enough.
 
 ## Limitations
 
-- In-memory state only — restarting the server resets scores and players.
+- Spotify auth doesn't persist — you'll need to re-log-in after a restart.
 - One game at a time.
 - Spotify's `currently-playing` endpoint can be a second or two stale after a
   skip; the server polls for up to ~4s to catch the new track.

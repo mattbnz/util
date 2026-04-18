@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +60,9 @@ func NewServer(cfg ServerConfig) *Server {
 	s.game.SetCallbacks(s.onRoundEnd, s.onAutoAdvance)
 	return s
 }
+
+// Game exposes the underlying game for wiring up storage/callbacks at startup.
+func (s *Server) Game() *Game { return s.game }
 
 // AdminURL returns the shareable URL that claims admin access.
 func (s *Server) AdminURL() string {
@@ -131,6 +135,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleStartRound(w, r)
 	case "/admin/end-round":
 		s.handleEndRound(w, r)
+	case "/admin/config":
+		s.handleConfig(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -246,12 +252,14 @@ func (s *Server) claimAdmin(w http.ResponseWriter, r *http.Request, token string
 }
 
 type adminPageData struct {
-	Authorized  bool
-	RedirectURI string
-	AdminURL    string
-	View        AdminView
-	Err         string
-	Flash       string
+	Authorized     bool
+	RedirectURI    string
+	AdminURL       string
+	View           AdminView
+	GraceSeconds   int
+	ResultsSeconds int
+	Err            string
+	Flash          string
 }
 
 func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
@@ -269,13 +277,16 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		s.render(w, "admin_claim.html", map[string]any{})
 		return
 	}
+	grace, results := s.game.Durations()
 	data := adminPageData{
-		Authorized:  s.spotify.Authorized(),
-		RedirectURI: s.cfg.RedirectURI,
-		AdminURL:    s.AdminURL(),
-		View:        s.game.AdminView(),
-		Err:         r.URL.Query().Get("err"),
-		Flash:       r.URL.Query().Get("flash"),
+		Authorized:     s.spotify.Authorized(),
+		RedirectURI:    s.cfg.RedirectURI,
+		AdminURL:       s.AdminURL(),
+		View:           s.game.AdminView(),
+		GraceSeconds:   int(grace / time.Second),
+		ResultsSeconds: int(results / time.Second),
+		Err:            r.URL.Query().Get("err"),
+		Flash:          r.URL.Query().Get("flash"),
 	}
 	data.View.Authorized = data.Authorized
 	s.render(w, "admin.html", data)
@@ -328,6 +339,17 @@ func (s *Server) handleStartRound(w http.ResponseWriter, r *http.Request) {
 		s.adminError(w, r, err.Error())
 		return
 	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) || r.Method != http.MethodPost {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	grace, _ := strconv.Atoi(r.FormValue("grace_seconds"))
+	results, _ := strconv.Atoi(r.FormValue("results_seconds"))
+	s.game.SetDurations(time.Duration(grace)*time.Second, time.Duration(results)*time.Second)
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 

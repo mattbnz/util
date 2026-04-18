@@ -38,14 +38,14 @@
       <div class="status active">Round {{.RoundNumber}} — a song is playing!</div>
       {{if .HasAnswered}}
         <p>You answered. Waiting for others…</p>
-        <p class="count">{{.AnswerCount}} of {{.PlayerCount}} players answered</p>
+        <p class="count"><span class="answered">{{.AnswerCount}}</span> of <span class="players">{{.PlayerCount}}</span> players answered</p>
       {{else}}
         <form method="post" action="/answer">
           <label>Song title <input type="text" name="song" autocomplete="off" autofocus required></label>
           <label>Artist <input type="text" name="artist" autocomplete="off" required></label>
           <button type="submit">Submit</button>
         </form>
-        <p class="count">{{.AnswerCount}} of {{.PlayerCount}} players answered so far</p>
+        <p class="count"><span class="answered">{{.AnswerCount}}</span> of <span class="players">{{.PlayerCount}}</span> players answered so far</p>
       {{end}}
       <div id="grace" class="countdown" data-deadline="{{.GraceUntilUnix}}" {{if not .GraceUntilUnix}}hidden{{end}}>
         Hurry! <span class="secs">—</span>s until the round auto-ends
@@ -122,13 +122,19 @@
         location.reload();
         return;
       }
-      // In-place update of countdown deadlines so the grace period banner
-      // can appear mid-round without reload.
+      // In-place updates for things that shouldn't trigger a reload — avoids
+      // wiping in-progress typing whenever another player submits.
       if (v.grace_until !== last.grace_until) {
         setDeadline('grace', v.grace_until);
       }
       if (v.auto_advance_at !== last.auto_advance_at) {
         setDeadline('advance', v.auto_advance_at);
+      }
+      if (v.answer_count !== last.answer_count) {
+        document.querySelectorAll('.count .answered').forEach(function(e){ e.textContent = v.answer_count; });
+      }
+      if (v.player_count !== last.player_count) {
+        document.querySelectorAll('.count .players').forEach(function(e){ e.textContent = v.player_count; });
       }
       last = v;
     } catch (err) { /* ignore */ }

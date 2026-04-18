@@ -6,18 +6,21 @@ import (
 	"time"
 )
 
-// Timings for the round lifecycle. Grace runs after 50% of players answer;
-// results period runs after the round ends before auto-advancing.
+// Default timings for the round lifecycle. Grace runs after 50% of players
+// answer; results period runs after the round ends before auto-advancing.
+// Both are configurable per-game via SetDurations.
 const (
-	graceDuration   = 30 * time.Second
-	resultsDuration = 30 * time.Second
+	defaultGraceDuration   = 30 * time.Second
+	defaultResultsDuration = 30 * time.Second
+	minDuration            = 5 * time.Second
+	maxDuration            = 5 * time.Minute
 )
 
 type Player struct {
 	ID       string    `json:"id"`
 	Name     string    `json:"name"`
 	Score    int       `json:"score"`
-	JoinedAt time.Time `json:"-"`
+	JoinedAt time.Time `json:"joined_at"`
 }
 
 type Answer struct {
@@ -48,17 +51,61 @@ type Game struct {
 	Players map[string]*Player
 	Number  int
 
+	graceDuration   time.Duration
+	resultsDuration time.Duration
+
 	graceTimer       *time.Timer
 	autoAdvanceTimer *time.Timer
 	onRoundEnd       func()
 	onAutoAdvance    func()
+	onChange         func()
 
 	playerSubs sync.Map
 	adminSubs  sync.Map
 }
 
 func NewGame() *Game {
-	return &Game{Players: make(map[string]*Player)}
+	return &Game{
+		Players:         make(map[string]*Player),
+		graceDuration:   defaultGraceDuration,
+		resultsDuration: defaultResultsDuration,
+	}
+}
+
+// SetChangeCallback registers a hook fired after any state change. Used by
+// the persistent store to mark itself dirty.
+func (g *Game) SetChangeCallback(fn func()) {
+	g.mu.Lock()
+	g.onChange = fn
+	g.mu.Unlock()
+}
+
+// Durations returns the current grace and results durations.
+func (g *Game) Durations() (time.Duration, time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.graceDuration, g.resultsDuration
+}
+
+// SetDurations updates the grace and results durations, clamped to a sane range.
+func (g *Game) SetDurations(grace, results time.Duration) {
+	grace = clampDuration(grace)
+	results = clampDuration(results)
+	g.mu.Lock()
+	g.graceDuration = grace
+	g.resultsDuration = results
+	g.mu.Unlock()
+	go g.notify()
+}
+
+func clampDuration(d time.Duration) time.Duration {
+	if d < minDuration {
+		return minDuration
+	}
+	if d > maxDuration {
+		return maxDuration
+	}
+	return d
 }
 
 // SetCallbacks registers hooks for round lifecycle. onRoundEnd runs (in a
@@ -87,6 +134,12 @@ func (g *Game) SubscribeAdmin(id string) chan struct{} {
 func (g *Game) UnsubscribeAdmin(id string) { g.adminSubs.Delete(id) }
 
 func (g *Game) notify() {
+	g.mu.Lock()
+	fn := g.onChange
+	g.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 	g.playerSubs.Range(func(_, v any) bool {
 		select {
 		case v.(chan struct{}) <- struct{}{}:
@@ -101,6 +154,53 @@ func (g *Game) notify() {
 		}
 		return true
 	})
+}
+
+// Snapshot captures persistable game state. The in-progress round is not
+// persisted — on restart we resume with scores and players intact but no
+// active round.
+type StateSnapshot struct {
+	Players          []Player `json:"players"`
+	RoundNumber      int      `json:"round_number"`
+	GraceDurationS   int      `json:"grace_duration_s"`
+	ResultsDurationS int      `json:"results_duration_s"`
+}
+
+func (g *Game) Snapshot() StateSnapshot {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	players := make([]Player, 0, len(g.Players))
+	for _, p := range g.Players {
+		players = append(players, *p)
+	}
+	return StateSnapshot{
+		Players:          players,
+		RoundNumber:      g.Number,
+		GraceDurationS:   int(g.graceDuration / time.Second),
+		ResultsDurationS: int(g.resultsDuration / time.Second),
+	}
+}
+
+// Restore applies a previously-saved snapshot. Should only be called before
+// the game starts serving traffic.
+func (g *Game) Restore(s StateSnapshot) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if s.GraceDurationS > 0 {
+		g.graceDuration = clampDuration(time.Duration(s.GraceDurationS) * time.Second)
+	}
+	if s.ResultsDurationS > 0 {
+		g.resultsDuration = clampDuration(time.Duration(s.ResultsDurationS) * time.Second)
+	}
+	g.Number = s.RoundNumber
+	for i := range s.Players {
+		p := s.Players[i]
+		if p.ID == "" {
+			continue
+		}
+		pp := p
+		g.Players[p.ID] = &pp
+	}
 }
 
 // --- player management ---
@@ -219,8 +319,8 @@ func (g *Game) SubmitAnswer(playerID, songGuess, artistGuess string) bool {
 		closed = true
 	case total > 0 && answered*2 >= total && g.Round.GraceUntil.IsZero():
 		// first time we've hit 50% — start grace period
-		g.Round.GraceUntil = time.Now().Add(graceDuration)
-		g.graceTimer = time.AfterFunc(graceDuration, g.endRoundByTimer)
+		g.Round.GraceUntil = time.Now().Add(g.graceDuration)
+		g.graceTimer = time.AfterFunc(g.graceDuration, g.endRoundByTimer)
 	}
 	g.mu.Unlock()
 	go g.notify()
@@ -258,7 +358,7 @@ func (g *Game) endRoundLocked() {
 	}
 	g.Round.Ended = true
 	g.Round.EndedAt = time.Now()
-	g.Round.AutoAdvanceAt = time.Now().Add(resultsDuration)
+	g.Round.AutoAdvanceAt = time.Now().Add(g.resultsDuration)
 	for _, ans := range g.Round.Answers {
 		p := g.Players[ans.PlayerID]
 		if p == nil {
@@ -272,7 +372,7 @@ func (g *Game) endRoundLocked() {
 		}
 	}
 	if g.onAutoAdvance != nil {
-		g.autoAdvanceTimer = time.AfterFunc(resultsDuration, g.onAutoAdvance)
+		g.autoAdvanceTimer = time.AfterFunc(g.resultsDuration, g.onAutoAdvance)
 	}
 	if g.onRoundEnd != nil {
 		go g.onRoundEnd()
