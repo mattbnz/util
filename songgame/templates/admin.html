@@ -302,7 +302,11 @@
     }
     var s = r.status;
     if (!s || s.raw_204 || !s.device_id) {
-      line.innerHTML = '<em>No active Spotify device.</em> Open Spotify on your phone or laptop and start playing.';
+      if (r.polled_at) {
+        line.innerHTML = '<em>No active Spotify device reported.</em> Open Spotify on your phone or laptop and start playing.';
+      } else {
+        line.innerHTML = '<em>Waiting for first playback poll…</em> (the poller idles when no round is active)';
+      }
       warn.style.display = 'none';
       return;
     }
@@ -311,6 +315,9 @@
     if (s.track_name) {
       var artists = (s.track_artists || []).join(', ');
       bits.push('<br>Spotify: <strong>' + s.track_name + '</strong> — ' + artists + ' <span class="muted">(' + fmtMS(s.progress_ms) + ' / ' + fmtMS(s.duration_ms) + ')</span>');
+    }
+    if (r.age_seconds >= 0) {
+      bits.push(' <span class="muted" style="font-size:0.8rem;">(last polled ' + r.age_seconds + 's ago)</span>');
     }
     line.innerHTML = bits.join('');
     if (r.mismatch) {

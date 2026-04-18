@@ -40,8 +40,21 @@ type Server struct {
 	oauthState string
 	adminToken string
 
-	volMu          sync.Mutex
-	preDuckVolume  int // 0 = not ducked; otherwise the volume we should restore to
+	volMu         sync.Mutex
+	preDuckVolume int // 0 = not ducked; otherwise the volume we should restore to
+
+	// Shared playback-state cache. A single background poller fills this in
+	// adaptively; both /admin/spotify-status and the auto-resync logic read
+	// from here, so we don't hammer /me/player with concurrent callers.
+	cacheMu    sync.RWMutex
+	cache      playbackCache
+	wakePoller chan struct{}
+}
+
+type playbackCache struct {
+	status   *PlaybackStatus
+	err      error
+	polledAt time.Time
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -56,6 +69,7 @@ func NewServer(cfg ServerConfig) *Server {
 		tpl:     tpl,
 	}
 	s.adminToken = randomHex(16)
+	s.wakePoller = make(chan struct{}, 1)
 	s.game.SetCallbacks(s.onRoundEnd, s.onAutoAdvance)
 	return s
 }
@@ -385,59 +399,97 @@ func (s *Server) handleStartRound(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
-// RunAutoResync periodically polls Spotify's playback state and, if an active
-// round's expected track has drifted from what Spotify is actually playing
-// across two consecutive observations, updates the round's track and re-grades
-// the submitted answers. Blocks until stop is closed.
-func (s *Server) RunAutoResync(interval time.Duration, stop <-chan struct{}) {
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	var observedURI string
-	var observedCount int
+// Playback poller cadences. In-sync polling is deliberately slow to keep
+// /me/player call volume low; mismatch ramps up briefly to confirm/resolve.
+// Idle is a long sleep — any round start wakes the loop immediately via
+// PokePlaybackPoller.
+const (
+	pollInSync    = 30 * time.Second
+	pollMismatch  = 5 * time.Second
+	pollIdle      = 5 * time.Minute
+)
+
+// PokePlaybackPoller asks the poller to run its next cycle immediately
+// (non-blocking). Call this when the expected state changes — a new round
+// starts, the admin forces a resync, etc.
+func (s *Server) PokePlaybackPoller() {
+	select {
+	case s.wakePoller <- struct{}{}:
+	default:
+	}
+}
+
+// LastPlaybackStatus returns the most recently cached Spotify playback state
+// along with the time of the poll and any error recorded.
+func (s *Server) LastPlaybackStatus() (*PlaybackStatus, time.Time, error) {
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
+	return s.cache.status, s.cache.polledAt, s.cache.err
+}
+
+// RunPlaybackPoller is the single source of /me/player traffic. It caches the
+// last status for the admin UI to read without hammering Spotify, and folds
+// the auto-resync logic into the same loop — if Spotify reports a different
+// track than the active round across two consecutive cycles, UpdateRoundTrack
+// is called. Cadence is adaptive:
+//
+//   - idle (no active round or not authorised): long sleep, no API calls
+//   - in sync: pollInSync
+//   - mismatch observed: pollMismatch until confirmed or resolved
+//
+// Blocks until stop is closed.
+func (s *Server) RunPlaybackPoller(stop <-chan struct{}) {
+	interval := pollInSync
+	var mismatchURI string
+	var mismatchCount int
 	for {
 		select {
 		case <-stop:
 			return
-		case <-t.C:
+		case <-time.After(interval):
+		case <-s.wakePoller:
 		}
 		if !s.spotify.Authorized() || !s.game.HasActiveRound() {
-			observedURI = ""
-			observedCount = 0
+			interval = pollIdle
+			mismatchURI = ""
+			mismatchCount = 0
+			continue
+		}
+		st, err := s.spotify.PlaybackStatus()
+		s.cacheMu.Lock()
+		s.cache = playbackCache{status: st, err: err, polledAt: time.Now()}
+		s.cacheMu.Unlock()
+		if err != nil {
+			interval = pollInSync // don't hammer; try again on normal cadence
 			continue
 		}
 		expected := s.game.CurrentTrackURI()
-		st, err := s.spotify.PlaybackStatus()
-		if err != nil {
-			continue
-		}
 		if st == nil || st.Raw204 || st.TrackURI == "" || st.TrackURI == expected {
-			observedURI = ""
-			observedCount = 0
+			interval = pollInSync
+			mismatchURI = ""
+			mismatchCount = 0
 			continue
 		}
-		// Mismatch — require persistence across two polls to ride out the
-		// brief staleness Spotify reports right after a skip.
-		if observedURI == st.TrackURI {
-			observedCount++
+		// Mismatch observed — require two consecutive sightings of the same
+		// wrong URI before resyncing, to ride out the brief staleness the API
+		// reports right after a skip.
+		if mismatchURI == st.TrackURI {
+			mismatchCount++
 		} else {
-			observedURI = st.TrackURI
-			observedCount = 1
+			mismatchURI = st.TrackURI
+			mismatchCount = 1
 		}
-		if observedCount < 2 {
-			continue
+		interval = pollMismatch
+		if mismatchCount >= 2 {
+			if track, ok := st.AsTrack(); ok {
+				if s.game.UpdateRoundTrack(track) {
+					log.Printf("auto-resync: round track updated to %q by %v", track.Name, track.ArtistNames())
+				}
+			}
+			mismatchURI = ""
+			mismatchCount = 0
+			interval = pollInSync
 		}
-		track, ok := st.AsTrack()
-		if !ok {
-			observedURI = ""
-			observedCount = 0
-			continue
-		}
-		if s.game.UpdateRoundTrack(track) {
-			log.Printf("auto-resync: round track updated to %q by %v (was out of sync for 2 polls)",
-				track.Name, track.ArtistNames())
-		}
-		observedURI = ""
-		observedCount = 0
 	}
 }
 
@@ -450,17 +502,21 @@ func (s *Server) handleSpotifyStatus(w http.ResponseWriter, r *http.Request) {
 	type resp struct {
 		Status         *PlaybackStatus `json:"status"`
 		Error          string          `json:"error,omitempty"`
+		PolledAt       int64           `json:"polled_at,omitempty"`
+		AgeSeconds     int             `json:"age_seconds,omitempty"`
 		RoundActive    bool            `json:"round_active"`
 		RoundTrackURI  string          `json:"round_track_uri"`
 		RoundTrackName string          `json:"round_track_name"`
 		Mismatch       bool            `json:"mismatch"`
 	}
-	out := resp{}
-	st, err := s.spotify.PlaybackStatus()
+	st, at, err := s.LastPlaybackStatus()
+	out := resp{Status: st}
+	if !at.IsZero() {
+		out.PolledAt = at.Unix()
+		out.AgeSeconds = int(time.Since(at).Seconds())
+	}
 	if err != nil {
 		out.Error = err.Error()
-	} else {
-		out.Status = st
 	}
 	s.game.mu.Lock()
 	if s.game.Round != nil && !s.game.Round.Ended {
@@ -499,6 +555,7 @@ func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
 	} else {
 		log.Printf("resync: no change; round track already matches Spotify")
 	}
+	s.PokePlaybackPoller()
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
@@ -577,6 +634,9 @@ func (s *Server) advanceToNextRound() error {
 		return fmt.Errorf("Spotify didn't report a track playing within a few seconds — make sure a playlist is playing on your phone (or another device) and try again")
 	}
 	s.game.StartRound(*track)
+	// Wake the playback poller so the in-sync status cache refreshes promptly
+	// (the poller would otherwise be on a long idle interval).
+	s.PokePlaybackPoller()
 	return nil
 }
 
