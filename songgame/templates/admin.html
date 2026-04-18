@@ -54,6 +54,7 @@
             <p class="muted">No playlist selected yet.</p>
           {{end}}
         {{end}}
+        {{if .Playlists}}
         <form method="post" action="/admin/select-playlist">
           <select name="playlist_id" onchange="this.form.playlist_name.value = this.options[this.selectedIndex].text" required>
             <option value="">— choose playlist —</option>
@@ -62,6 +63,9 @@
           <input type="hidden" name="playlist_name" value="">
           <button type="submit" class="secondary">Load</button>
         </form>
+        {{else}}
+        <p class="muted">No usable playlists found. As of Feb 2026 Spotify Dev Mode apps can only read playlists you own or collaborate on — editorial playlists (Daily Mix, Discover Weekly, Spotify-curated) are blocked. Create a playlist in your Spotify app and it will appear here.</p>
+        {{end}}
       </div>
 
       <div class="card">

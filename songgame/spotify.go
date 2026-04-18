@@ -164,14 +164,33 @@ type SpotifyPlaylist struct {
 	ID    string `json:"id"`
 	Name  string `json:"name"`
 	Owner struct {
+		ID          string `json:"id"`
 		DisplayName string `json:"display_name"`
 	} `json:"owner"`
-	Tracks struct {
+	Collaborative bool `json:"collaborative"`
+	Tracks        struct {
 		Total int `json:"total"`
 	} `json:"tracks"`
 }
 
+func (s *SpotifyClient) Me() (string, error) {
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := s.do("GET", "/me", nil, &out); err != nil {
+		return "", err
+	}
+	return out.ID, nil
+}
+
+// ListPlaylists returns playlists the user owns or collaborates on. Playlists
+// owned by Spotify (editorial/algorithmic, like Daily Mixes or Discover Weekly)
+// are excluded because Dev Mode apps can't read their contents as of Feb 2026.
 func (s *SpotifyClient) ListPlaylists() ([]SpotifyPlaylist, error) {
+	me, err := s.Me()
+	if err != nil {
+		return nil, err
+	}
 	var all []SpotifyPlaylist
 	next := "/me/playlists?limit=50"
 	for next != "" {
@@ -182,7 +201,11 @@ func (s *SpotifyClient) ListPlaylists() ([]SpotifyPlaylist, error) {
 		if err := s.do("GET", next, nil, &page); err != nil {
 			return nil, err
 		}
-		all = append(all, page.Items...)
+		for _, p := range page.Items {
+			if p.Owner.ID == me || p.Collaborative {
+				all = append(all, p)
+			}
+		}
 		if page.Next == "" {
 			break
 		}
