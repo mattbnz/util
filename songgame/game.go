@@ -53,6 +53,16 @@ type RoundResult struct {
 	Answers []*Answer `json:"answers"`
 }
 
+// LiveAnswer is a narrow view of an in-progress answer, exposed to players
+// who have already submitted. Correctness is deliberately omitted so watching
+// the live feed doesn't leak the right answer.
+type LiveAnswer struct {
+	PlayerID    string `json:"player_id"`
+	PlayerName  string `json:"player_name"`
+	SongGuess   string `json:"song_guess"`
+	ArtistGuess string `json:"artist_guess"`
+}
+
 type Game struct {
 	mu sync.Mutex
 
@@ -433,23 +443,24 @@ func (g *Game) endRoundLocked() {
 // --- state snapshots for rendering/SSE ---
 
 type PlayerView struct {
-	RoundNumber     int          `json:"round_number"`
-	RoundActive     bool         `json:"round_active"`
-	RoundEnded      bool         `json:"round_ended"`
-	HasAnswered     bool         `json:"has_answered"`
-	YourSongOK      bool         `json:"your_song_ok"`
-	YourArtistOK    bool         `json:"your_artist_ok"`
-	YourSongGuess   string       `json:"your_song_guess"`
-	YourArtistGuess string       `json:"your_artist_guess"`
-	AnswerCount     int          `json:"answer_count"`
-	PlayerCount     int          `json:"player_count"`
-	GraceUntilUnix  int64        `json:"grace_until,omitempty"`
-	AutoAdvanceUnix int64        `json:"auto_advance_at,omitempty"`
-	RevealSong      string       `json:"reveal_song,omitempty"`
-	RevealArtists   string       `json:"reveal_artists,omitempty"`
-	Scoreboard      []*Player    `json:"scoreboard"`
-	You             *Player      `json:"you"`
-	PrevRound       *RoundResult `json:"prev_round,omitempty"`
+	RoundNumber     int           `json:"round_number"`
+	RoundActive     bool          `json:"round_active"`
+	RoundEnded      bool          `json:"round_ended"`
+	HasAnswered     bool          `json:"has_answered"`
+	YourSongOK      bool          `json:"your_song_ok"`
+	YourArtistOK   bool          `json:"your_artist_ok"`
+	YourSongGuess   string        `json:"your_song_guess"`
+	YourArtistGuess string        `json:"your_artist_guess"`
+	AnswerCount     int           `json:"answer_count"`
+	PlayerCount     int           `json:"player_count"`
+	GraceUntilUnix  int64         `json:"grace_until,omitempty"`
+	AutoAdvanceUnix int64         `json:"auto_advance_at,omitempty"`
+	RevealSong      string        `json:"reveal_song,omitempty"`
+	RevealArtists   string        `json:"reveal_artists,omitempty"`
+	Scoreboard      []*Player     `json:"scoreboard"`
+	You             *Player       `json:"you"`
+	PrevRound       *RoundResult  `json:"prev_round,omitempty"`
+	LiveAnswers     []*LiveAnswer `json:"live_answers,omitempty"`
 }
 
 func (g *Game) PlayerView(playerID string) PlayerView {
@@ -477,6 +488,23 @@ func (g *Game) PlayerView(playerID string) PlayerView {
 			if g.Round.Ended {
 				v.YourSongOK = ans.SongCorrect
 				v.YourArtistOK = ans.ArtistCorrect
+			}
+			// Expose other players' guesses (no correctness) to this player
+			// while the round is still live — gives them something to watch
+			// and reveals nothing about the right answer.
+			if !g.Round.Ended {
+				for _, a := range g.Round.Answers {
+					v.LiveAnswers = append(v.LiveAnswers, &LiveAnswer{
+						PlayerID:    a.PlayerID,
+						PlayerName:  a.PlayerName,
+						SongGuess:   a.SongGuess,
+						ArtistGuess: a.ArtistGuess,
+					})
+				}
+				sort.Slice(v.LiveAnswers, func(i, j int) bool {
+					return g.Round.Answers[v.LiveAnswers[i].PlayerID].SubmittedAt.Before(
+						g.Round.Answers[v.LiveAnswers[j].PlayerID].SubmittedAt)
+				})
 			}
 		}
 		if g.Round.Ended {

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -101,6 +103,38 @@ func TestStartRoundCancelsAutoAdvanceTimer(t *testing.T) {
 	v := g.AdminView()
 	if v.AutoAdvanceUnix != 0 {
 		t.Fatalf("AutoAdvanceUnix should be cleared for fresh round, got %d", v.AutoAdvanceUnix)
+	}
+}
+
+func TestLiveAnswersOnlyVisibleToAnsweredPlayers(t *testing.T) {
+	g := NewGame()
+	g.AddOrUpdatePlayer("a", "Alice")
+	g.AddOrUpdatePlayer("b", "Bob")
+	g.AddOrUpdatePlayer("c", "Carol")
+	g.StartRound(track("t1", "Imagine", "John Lennon"))
+	g.SubmitAnswer("a", "Imagine", "Lennon") // alice has answered
+
+	// Alice has answered — she sees the live list.
+	va := g.PlayerView("a")
+	if len(va.LiveAnswers) != 1 {
+		t.Fatalf("Alice should see 1 live answer; got %d", len(va.LiveAnswers))
+	}
+	if va.LiveAnswers[0].PlayerID != "a" || va.LiveAnswers[0].SongGuess != "Imagine" {
+		t.Errorf("unexpected live answer: %+v", va.LiveAnswers[0])
+	}
+
+	// Bob hasn't answered — he must NOT see the live feed (would spoil his guess).
+	vb := g.PlayerView("b")
+	if len(vb.LiveAnswers) != 0 {
+		t.Fatalf("Bob hasn't answered — LiveAnswers must be empty; got %+v", vb.LiveAnswers)
+	}
+
+	// LiveAnswer struct must not expose correctness fields.
+	// Verified by type; enforce via JSON marshalling: the marshalled bytes
+	// must not contain "song_correct" / "artist_correct".
+	b, _ := json.Marshal(va.LiveAnswers[0])
+	if strings.Contains(string(b), "correct") {
+		t.Errorf("LiveAnswer JSON leaked correctness: %s", b)
 	}
 }
 
