@@ -228,6 +228,7 @@ type StateSnapshot struct {
 	SpotifyRefreshToken string `json:"spotify_refresh_token,omitempty"`
 	SpotifyClientID     string `json:"spotify_client_id,omitempty"`
 	SpotifyClientSecret string `json:"spotify_client_secret,omitempty"`
+	SpotifyDeviceID     string `json:"spotify_device_id,omitempty"`
 }
 
 func (g *Game) Snapshot() StateSnapshot {

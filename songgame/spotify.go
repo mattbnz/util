@@ -261,6 +261,7 @@ type CurrentlyPlaying struct {
 	IsPlaying bool          `json:"is_playing"`
 	Item      *SpotifyTrack `json:"item"`
 	Device    *struct {
+		ID   string `json:"id"`
 		Name string `json:"name"`
 		Type string `json:"type"`
 	} `json:"device"`
@@ -298,7 +299,30 @@ func (s *SpotifyClient) CurrentlyPlaying() (*CurrentlyPlaying, error) {
 	return &cp, nil
 }
 
-// Next skips to the next track on whichever device is currently active.
-func (s *SpotifyClient) Next() error {
-	return s.do("POST", "/me/player/next", nil, nil)
+type SpotifyDevice struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	IsActive bool   `json:"is_active"`
+}
+
+// Devices lists the user's available Spotify Connect devices.
+func (s *SpotifyClient) Devices() ([]SpotifyDevice, error) {
+	var out struct {
+		Devices []SpotifyDevice `json:"devices"`
+	}
+	if err := s.do("GET", "/me/player/devices", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Devices, nil
+}
+
+// Next skips to the next track. If deviceID is non-empty, the skip is
+// targeted at that specific Spotify Connect device.
+func (s *SpotifyClient) Next(deviceID string) error {
+	path := "/me/player/next"
+	if deviceID != "" {
+		path += "?device_id=" + url.QueryEscape(deviceID)
+	}
+	return s.do("POST", path, nil, nil)
 }
