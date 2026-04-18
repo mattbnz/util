@@ -22,6 +22,7 @@ type ServerConfig struct {
 	ClientID     string
 	ClientSecret string
 	RedirectURI  string
+	BaseURL      string // e.g. http://127.0.0.1:8080 — used to print the shareable admin URL
 }
 
 // Volume to drop to during the results period. 30% is a "background" level
@@ -54,9 +55,16 @@ func NewServer(cfg ServerConfig) *Server {
 		tpl:     tpl,
 	}
 	s.adminToken = randomHex(16)
-	log.Printf("admin token (auto-set on first visit): %s", s.adminToken)
+	log.Printf("admin URL (share with whoever should host): %s/admin?t=%s", cfg.BaseURL, s.adminToken)
 	s.game.SetCallbacks(s.onRoundEnd, s.onAutoAdvance)
 	return s
+}
+
+// AdminURL returns the shareable URL that claims admin access.
+func (s *Server) AdminURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg.BaseURL + "/admin?t=" + s.adminToken
 }
 
 func (s *Server) onRoundEnd() {
@@ -217,38 +225,54 @@ func (s *Server) isAdmin(r *http.Request) bool {
 	return c.Value == s.adminToken
 }
 
-// ensureAdmin auto-sets the admin cookie for the first browser to reach /admin.
-// Restart the server to rotate.
-func (s *Server) ensureAdmin(w http.ResponseWriter, r *http.Request) {
-	if s.isAdmin(r) {
-		return
-	}
+// claimAdmin sets the admin cookie if the supplied token matches.
+// Returns true if the caller is authenticated after this call.
+func (s *Server) claimAdmin(w http.ResponseWriter, r *http.Request, token string) bool {
 	s.mu.Lock()
-	token := s.adminToken
+	expected := s.adminToken
 	s.mu.Unlock()
+	if token == "" || token != expected {
+		return s.isAdmin(r)
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     adminCookie,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		MaxAge:   60 * 60 * 24,
+		MaxAge:   60 * 60 * 24 * 7,
 	})
+	return true
 }
 
 type adminPageData struct {
 	Authorized  bool
 	RedirectURI string
+	AdminURL    string
 	View        AdminView
 	Err         string
 	Flash       string
 }
 
 func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
-	s.ensureAdmin(w, r)
+	// Claim flow: /admin?t=<token> sets the cookie, then redirects to /admin
+	// without the token so it doesn't linger in the address bar or history.
+	if tok := r.URL.Query().Get("t"); tok != "" {
+		if !s.claimAdmin(w, r, tok) {
+			http.Error(w, "invalid admin token", http.StatusForbidden)
+			return
+		}
+		http.Redirect(w, r, "/admin", http.StatusSeeOther)
+		return
+	}
+	if !s.isAdmin(r) {
+		s.render(w, "admin_claim.html", map[string]any{})
+		return
+	}
 	data := adminPageData{
 		Authorized:  s.spotify.Authorized(),
 		RedirectURI: s.cfg.RedirectURI,
+		AdminURL:    s.AdminURL(),
 		View:        s.game.AdminView(),
 		Err:         r.URL.Query().Get("err"),
 		Flash:       r.URL.Query().Get("flash"),
@@ -258,7 +282,10 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
-	s.ensureAdmin(w, r)
+	if !s.isAdmin(r) {
+		http.Error(w, "forbidden — claim admin first", http.StatusForbidden)
+		return
+	}
 	state := randomHex(16)
 	s.mu.Lock()
 	s.oauthState = state

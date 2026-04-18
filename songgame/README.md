@@ -57,12 +57,16 @@ Flags:
 
 Then:
 
-1. Open `http://127.0.0.1:8080/admin` and click "Log in with Spotify". First
-   browser to reach `/admin` owns the admin session; restart to rotate.
-2. On Spotify (your phone works well), pick a playlist, enable shuffle, tap
+1. On startup the server logs a shareable admin URL, e.g.
+   `http://127.0.0.1:8080/admin?t=<token>`. Open it to claim admin access
+   (the token is swapped for a cookie and stripped from the URL). Forward
+   the same link to anyone else who should co-host — the admin page also
+   has a "Copy" button for it. The token rotates on every server restart.
+2. Click "Log in with Spotify" on the admin page.
+3. On Spotify (your phone works well), pick a playlist, enable shuffle, tap
    play. The device must be active for the API to find it.
-3. Players join at `http://<your-laptop-ip>:8080/`.
-4. Click "Start round 1". On subsequent rounds the server will skip to a new
+4. Players join at `http://<your-laptop-ip>:8080/`.
+5. Click "Start round 1". On subsequent rounds the server will skip to a new
    song automatically.
 
 ## Matching

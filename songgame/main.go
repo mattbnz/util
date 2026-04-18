@@ -26,11 +26,11 @@ func main() {
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		RedirectURI:  *redirectBase + "/admin/callback",
+		BaseURL:      *redirectBase,
 	})
 
 	log.Printf("songgame listening on %s", *addr)
-	log.Printf("admin:   %s/admin", *redirectBase)
-	log.Printf("players: %s/", *redirectBase)
+	log.Printf("players join at: %s/", *redirectBase)
 	if err := http.ListenAndServe(*addr, srv); err != nil {
 		log.Fatal(err)
 	}

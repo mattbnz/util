@@ -54,6 +54,22 @@
       </ol>
     </div>
 
+    <div class="card">
+      <h3>Share admin access</h3>
+      <p class="muted">Anyone with this link can control the game. Send it only to people you want to co-host.</p>
+      <div style="display:flex; gap:0.5rem; align-items:center;">
+        <input id="adminlink" type="text" readonly value="{{.AdminURL}}"
+               style="flex:1; padding:0.4rem; font-family:ui-monospace,monospace; font-size:0.85rem; border:1px solid #ccc; border-radius:4px;"
+               onclick="this.select()">
+        <button type="button" class="secondary" onclick="
+          var i=document.getElementById('adminlink'); i.select();
+          navigator.clipboard&&navigator.clipboard.writeText(i.value);
+          this.textContent='Copied';
+          setTimeout(function(){event.target.textContent='Copy';},1500);
+        ">Copy</button>
+      </div>
+    </div>
+
     {{with .View}}
     <div class="card">
       <h3>
