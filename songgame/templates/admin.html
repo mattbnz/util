@@ -15,13 +15,12 @@
   button.secondary { background: #555; }
   button.danger { background: #c33; }
   button:disabled { background: #aaa; cursor: not-allowed; }
-  form { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
-  select { padding: 0.5rem; font-size: 1rem; min-width: 16rem; }
+  form { display: inline-block; margin-right: 0.5rem; }
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #eee; font-size: 0.95rem; }
   th { color: #666; font-size: 0.85rem; }
   .muted { color: #888; }
-  .err { color: #c33; }
+  .err { color: #c33; background: #fdecea; border-color: #f5c2bd; }
   .pill { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; background: #eee; font-size: 0.8rem; }
   .pill.active { background: #d6f5df; color: #0a6e2c; }
   .pill.ended { background: #fbe3c1; color: #7a4910; }
@@ -43,49 +42,13 @@
       <form method="get" action="/admin/login"><button type="submit">Log in with Spotify</button></form>
     </div>
   {{else}}
-    <div class="grid">
-      <div class="card">
-        <h3>Playlist</h3>
-        {{with .View}}
-          {{if .PlaylistID}}
-            <p class="now">{{.PlaylistName}}</p>
-            <p class="muted">{{.TrackCount}} tracks loaded</p>
-          {{else}}
-            <p class="muted">No playlist selected yet.</p>
-          {{end}}
-        {{end}}
-        {{if .Playlists}}
-        <form method="post" action="/admin/select-playlist">
-          <select name="playlist_id" onchange="this.form.playlist_name.value = this.options[this.selectedIndex].text" required>
-            <option value="">— choose playlist —</option>
-            {{range .Playlists}}<option value="{{.ID}}">{{.Name}} ({{.Tracks.Total}} tracks)</option>{{end}}
-          </select>
-          <input type="hidden" name="playlist_name" value="">
-          <button type="submit" class="secondary">Load</button>
-        </form>
-        {{else}}
-        <p class="muted">No usable playlists found. As of Feb 2026 Spotify Dev Mode apps can only read playlists you own or collaborate on — editorial playlists (Daily Mix, Discover Weekly, Spotify-curated) are blocked. Create a playlist in your Spotify app and it will appear here.</p>
-        {{end}}
-      </div>
-
-      <div class="card">
-        <h3>Playback device</h3>
-        {{with .View}}
-          {{if .DeviceID}}
-            <p class="now">{{.DeviceName}}</p>
-          {{else}}
-            <p class="muted">No device selected. Open Spotify on the device you want to play on, then refresh.</p>
-          {{end}}
-        {{end}}
-        <form method="post" action="/admin/select-device">
-          <select name="device_id" onchange="this.form.device_name.value = this.options[this.selectedIndex].text" required>
-            <option value="">— choose device —</option>
-            {{range .Devices}}<option value="{{.ID}}">{{.Name}} ({{.Type}}{{if .IsActive}} · active{{end}})</option>{{end}}
-          </select>
-          <input type="hidden" name="device_name" value="">
-          <button type="submit" class="secondary">Use</button>
-        </form>
-      </div>
+    <div class="card">
+      <h3>How to play</h3>
+      <ol>
+        <li>On your phone (or any Spotify device), open a playlist and turn on <strong>shuffle</strong>, then hit play.</li>
+        <li>Come back here. Click <strong>Start next round</strong>: the server skips to the next song and records it as the round's answer.</li>
+        <li>Players answer at the root URL. The round ends once half have answered, or you click <strong>End round now</strong>.</li>
+      </ol>
     </div>
 
     {{with .View}}
@@ -100,13 +63,13 @@
         <p class="muted">No round in progress.</p>
       {{end}}
       <p class="muted">{{.AnswerCount}} of {{.PlayerCount}} players answered</p>
-      <form method="post" action="/admin/start-round" style="display:inline">
-        <button type="submit" {{if or (not .PlaylistID) (not .DeviceID)}}disabled{{end}}>
-          {{if .RoundActive}}Skip to next round{{else}}Start next round{{end}}
+      <form method="post" action="/admin/start-round">
+        <button type="submit">
+          {{if eq .RoundNumber 0}}Start round 1{{else if .RoundActive}}Skip to next round{{else}}Start next round{{end}}
         </button>
       </form>
       {{if .RoundActive}}
-      <form method="post" action="/admin/end-round" style="display:inline">
+      <form method="post" action="/admin/end-round">
         <button type="submit" class="danger">End round now</button>
       </form>
       {{end}}
@@ -152,20 +115,14 @@
     try {
       var v = JSON.parse(e.data);
       if (last === null) { last = v; return; }
-      // Only reload on state transitions that affect the whole page — avoids
-      // infinite loops on the initial snapshot and stops the page reloading
-      // out from under a dropdown while the admin is mid-click.
       var changed = (v.round_number !== last.round_number ||
                      v.round_active !== last.round_active ||
                      v.round_ended  !== last.round_ended  ||
                      v.authorized   !== last.authorized   ||
-                     v.playlist_id  !== last.playlist_id  ||
-                     v.device_id    !== last.device_id    ||
                      v.player_count !== last.player_count ||
                      v.answer_count !== last.answer_count);
       last = v;
       if (!changed) return;
-      // Don't yank focus from a form the admin is interacting with.
       var ae = document.activeElement;
       if (ae && (ae.tagName === "SELECT" || ae.tagName === "INPUT" || ae.tagName === "BUTTON")) return;
       location.reload();

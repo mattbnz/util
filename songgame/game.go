@@ -1,7 +1,6 @@
 package main
 
 import (
-	"math/rand"
 	"sort"
 	"sync"
 	"time"
@@ -25,40 +24,27 @@ type Answer struct {
 }
 
 type Round struct {
-	Number    int                `json:"number"`
-	Track     SpotifyTrack       `json:"-"`
-	Answers   map[string]*Answer `json:"-"`
-	StartedAt time.Time          `json:"-"`
-	Ended     bool               `json:"ended"`
-	EndedAt   time.Time          `json:"-"`
+	Number    int
+	Track     SpotifyTrack
+	Answers   map[string]*Answer
+	StartedAt time.Time
+	Ended     bool
+	EndedAt   time.Time
 }
 
 type Game struct {
 	mu sync.Mutex
 
-	PlaylistID   string
-	PlaylistName string
-	DeviceID     string
-	DeviceName   string
-
-	Tracks     []SpotifyTrack
-	TrackQueue []int
-
 	Round   *Round
 	Players map[string]*Player
 	Number  int
 
-	playerSubs sync.Map // id -> chan struct{} (notify)
+	playerSubs sync.Map
 	adminSubs  sync.Map
-
-	rng *rand.Rand
 }
 
 func NewGame() *Game {
-	return &Game{
-		Players: make(map[string]*Player),
-		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
-	}
+	return &Game{Players: make(map[string]*Player)}
 }
 
 // --- subscription plumbing ---
@@ -68,7 +54,7 @@ func (g *Game) SubscribePlayer(id string) chan struct{} {
 	g.playerSubs.Store(id, ch)
 	return ch
 }
-func (g *Game) UnsubscribePlayer(id string)   { g.playerSubs.Delete(id) }
+func (g *Game) UnsubscribePlayer(id string) { g.playerSubs.Delete(id) }
 func (g *Game) SubscribeAdmin(id string) chan struct{} {
 	ch := make(chan struct{}, 4)
 	g.adminSubs.Store(id, ch)
@@ -117,59 +103,34 @@ func (g *Game) GetPlayer(id string) *Player {
 	return g.Players[id]
 }
 
-func (g *Game) PlayerList() []*Player {
+// HasActiveRound returns true if a round is currently open.
+func (g *Game) HasActiveRound() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	out := make([]*Player, 0, len(g.Players))
-	for _, p := range g.Players {
-		out = append(out, p)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Score != out[j].Score {
-			return out[i].Score > out[j].Score
-		}
-		return out[i].JoinedAt.Before(out[j].JoinedAt)
-	})
-	return out
+	return g.Round != nil && !g.Round.Ended
 }
 
-// --- playlist setup ---
-
-func (g *Game) SetPlaylist(id, name string, tracks []SpotifyTrack) {
+// HasPreviousRound returns true if at least one round has been played.
+func (g *Game) HasPreviousRound() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.PlaylistID = id
-	g.PlaylistName = name
-	g.Tracks = tracks
-	g.TrackQueue = g.rng.Perm(len(tracks))
-	g.Round = nil
-	g.Number = 0
-	go g.notify()
+	return g.Number > 0
 }
 
-func (g *Game) SetDevice(id, name string) {
+// CurrentTrackURI returns the URI of the currently-playing round's track, or "".
+func (g *Game) CurrentTrackURI() string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.DeviceID = id
-	g.DeviceName = name
-	go g.notify()
+	if g.Round == nil {
+		return ""
+	}
+	return g.Round.Track.URI
 }
 
-// --- round management ---
-
-// StartRound picks the next track and returns it; caller is responsible for telling Spotify to play it.
-func (g *Game) StartRound() (*SpotifyTrack, error) {
+// StartRound opens a new round for the given track.
+func (g *Game) StartRound(track SpotifyTrack) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if len(g.Tracks) == 0 {
-		return nil, errStr("no playlist loaded")
-	}
-	if len(g.TrackQueue) == 0 {
-		g.TrackQueue = g.rng.Perm(len(g.Tracks))
-	}
-	idx := g.TrackQueue[0]
-	g.TrackQueue = g.TrackQueue[1:]
-	track := g.Tracks[idx]
 	g.Number++
 	g.Round = &Round{
 		Number:    g.Number,
@@ -178,29 +139,27 @@ func (g *Game) StartRound() (*SpotifyTrack, error) {
 		StartedAt: time.Now(),
 	}
 	go g.notify()
-	return &track, nil
 }
 
-// SubmitAnswer records a player's guess for the active round.
-// Returns (accepted, songCorrect, artistCorrect, roundClosed).
-func (g *Game) SubmitAnswer(playerID, songGuess, artistGuess string) (bool, bool, bool, bool) {
+// SubmitAnswer records a player's guess. Returns roundClosed=true if this submission ended the round.
+func (g *Game) SubmitAnswer(playerID, songGuess, artistGuess string) bool {
 	g.mu.Lock()
 	if g.Round == nil || g.Round.Ended {
 		g.mu.Unlock()
-		return false, false, false, false
+		return false
 	}
 	p, ok := g.Players[playerID]
 	if !ok {
 		g.mu.Unlock()
-		return false, false, false, false
+		return false
 	}
 	if _, already := g.Round.Answers[playerID]; already {
 		g.mu.Unlock()
-		return false, false, false, false
+		return false
 	}
 	songOK := fuzzyMatch(songGuess, g.Round.Track.Name)
 	artistOK := matchAnyArtist(artistGuess, g.Round.Track.ArtistNames())
-	ans := &Answer{
+	g.Round.Answers[playerID] = &Answer{
 		PlayerID:      playerID,
 		PlayerName:    p.Name,
 		SongGuess:     songGuess,
@@ -209,8 +168,6 @@ func (g *Game) SubmitAnswer(playerID, songGuess, artistGuess string) (bool, bool
 		ArtistCorrect: artistOK,
 		SubmittedAt:   time.Now(),
 	}
-	g.Round.Answers[playerID] = ans
-	// Check auto-end: once half or more of players have answered
 	closed := false
 	if len(g.Round.Answers)*2 >= len(g.Players) && len(g.Players) > 0 {
 		g.endRoundLocked()
@@ -218,10 +175,10 @@ func (g *Game) SubmitAnswer(playerID, songGuess, artistGuess string) (bool, bool
 	}
 	g.mu.Unlock()
 	go g.notify()
-	return true, songOK, artistOK, closed
+	return closed
 }
 
-// EndRound ends the current round immediately. Returns whether a round was ended.
+// EndRound closes the active round immediately. Returns true if a round was ended.
 func (g *Game) EndRound() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -254,30 +211,26 @@ func (g *Game) endRoundLocked() {
 // --- state snapshots for rendering/SSE ---
 
 type PlayerView struct {
-	PlaylistName   string        `json:"playlist_name"`
-	RoundNumber    int           `json:"round_number"`
-	RoundActive    bool          `json:"round_active"`
-	RoundEnded     bool          `json:"round_ended"`
-	HasAnswered    bool          `json:"has_answered"`
-	YourSongOK     bool          `json:"your_song_ok"`
-	YourArtistOK   bool          `json:"your_artist_ok"`
-	YourSongGuess  string        `json:"your_song_guess"`
-	YourArtistGuess string       `json:"your_artist_guess"`
-	AnswerCount    int           `json:"answer_count"`
-	PlayerCount    int           `json:"player_count"`
-	RevealSong     string        `json:"reveal_song,omitempty"`
-	RevealArtists  string        `json:"reveal_artists,omitempty"`
-	Scoreboard     []*Player     `json:"scoreboard"`
-	You            *Player       `json:"you"`
+	RoundNumber     int       `json:"round_number"`
+	RoundActive     bool      `json:"round_active"`
+	RoundEnded      bool      `json:"round_ended"`
+	HasAnswered     bool      `json:"has_answered"`
+	YourSongOK      bool      `json:"your_song_ok"`
+	YourArtistOK    bool      `json:"your_artist_ok"`
+	YourSongGuess   string    `json:"your_song_guess"`
+	YourArtistGuess string    `json:"your_artist_guess"`
+	AnswerCount     int       `json:"answer_count"`
+	PlayerCount     int       `json:"player_count"`
+	RevealSong      string    `json:"reveal_song,omitempty"`
+	RevealArtists   string    `json:"reveal_artists,omitempty"`
+	Scoreboard      []*Player `json:"scoreboard"`
+	You             *Player   `json:"you"`
 }
 
 func (g *Game) PlayerView(playerID string) PlayerView {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	v := PlayerView{
-		PlaylistName: g.PlaylistName,
-		PlayerCount:  len(g.Players),
-	}
+	v := PlayerView{PlayerCount: len(g.Players)}
 	if p, ok := g.Players[playerID]; ok {
 		v.You = p
 	}
@@ -290,7 +243,6 @@ func (g *Game) PlayerView(playerID string) PlayerView {
 			v.HasAnswered = true
 			v.YourSongGuess = ans.SongGuess
 			v.YourArtistGuess = ans.ArtistGuess
-			// Don't reveal correctness until round ends
 			if g.Round.Ended {
 				v.YourSongOK = ans.SongCorrect
 				v.YourArtistOK = ans.ArtistCorrect
@@ -306,34 +258,22 @@ func (g *Game) PlayerView(playerID string) PlayerView {
 }
 
 type AdminView struct {
-	Authorized     bool              `json:"authorized"`
-	PlaylistName   string            `json:"playlist_name"`
-	PlaylistID     string            `json:"playlist_id"`
-	DeviceID       string            `json:"device_id"`
-	DeviceName     string            `json:"device_name"`
-	TrackCount     int               `json:"track_count"`
-	RoundNumber    int               `json:"round_number"`
-	RoundActive    bool              `json:"round_active"`
-	RoundEnded     bool              `json:"round_ended"`
-	CurrentSong    string            `json:"current_song"`
-	CurrentArtists string            `json:"current_artists"`
-	AnswerCount    int               `json:"answer_count"`
-	PlayerCount    int               `json:"player_count"`
-	Answers        []*Answer         `json:"answers"`
-	Scoreboard     []*Player         `json:"scoreboard"`
+	Authorized     bool      `json:"authorized"`
+	RoundNumber    int       `json:"round_number"`
+	RoundActive    bool      `json:"round_active"`
+	RoundEnded     bool      `json:"round_ended"`
+	CurrentSong    string    `json:"current_song"`
+	CurrentArtists string    `json:"current_artists"`
+	AnswerCount    int       `json:"answer_count"`
+	PlayerCount    int       `json:"player_count"`
+	Answers        []*Answer `json:"answers"`
+	Scoreboard     []*Player `json:"scoreboard"`
 }
 
 func (g *Game) AdminView() AdminView {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	v := AdminView{
-		PlaylistName: g.PlaylistName,
-		PlaylistID:   g.PlaylistID,
-		DeviceID:     g.DeviceID,
-		DeviceName:   g.DeviceName,
-		TrackCount:   len(g.Tracks),
-		PlayerCount:  len(g.Players),
-	}
+	v := AdminView{PlayerCount: len(g.Players)}
 	if g.Round != nil {
 		v.RoundNumber = g.Round.Number
 		v.RoundActive = !g.Round.Ended
@@ -381,7 +321,3 @@ func joinArtists(artists []string) string {
 	s += " & " + artists[len(artists)-1]
 	return s
 }
-
-type errStr string
-
-func (e errStr) Error() string { return string(e) }

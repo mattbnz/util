@@ -9,6 +9,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -31,7 +32,7 @@ type Server struct {
 
 	mu         sync.Mutex
 	oauthState string
-	adminToken string // cookie value required for /admin/*
+	adminToken string
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -51,30 +52,26 @@ func NewServer(cfg ServerConfig) *Server {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	switch {
-	case r.URL.Path == "/":
+	switch r.URL.Path {
+	case "/":
 		s.handlePlayerRoot(w, r)
-	case r.URL.Path == "/join":
+	case "/join":
 		s.handleJoin(w, r)
-	case r.URL.Path == "/answer":
+	case "/answer":
 		s.handleAnswer(w, r)
-	case r.URL.Path == "/events":
+	case "/events":
 		s.handlePlayerEvents(w, r)
-	case r.URL.Path == "/admin":
+	case "/admin":
 		s.handleAdmin(w, r)
-	case r.URL.Path == "/admin/login":
+	case "/admin/login":
 		s.handleAdminLogin(w, r)
-	case r.URL.Path == "/admin/callback":
+	case "/admin/callback":
 		s.handleAdminCallback(w, r)
-	case r.URL.Path == "/admin/events":
+	case "/admin/events":
 		s.handleAdminEvents(w, r)
-	case r.URL.Path == "/admin/select-playlist":
-		s.handleSelectPlaylist(w, r)
-	case r.URL.Path == "/admin/select-device":
-		s.handleSelectDevice(w, r)
-	case r.URL.Path == "/admin/start-round":
+	case "/admin/start-round":
 		s.handleStartRound(w, r)
-	case r.URL.Path == "/admin/end-round":
+	case "/admin/end-round":
 		s.handleEndRound(w, r)
 	default:
 		http.NotFound(w, r)
@@ -95,18 +92,11 @@ func (s *Server) playerID(r *http.Request) string {
 
 func (s *Server) handlePlayerRoot(w http.ResponseWriter, r *http.Request) {
 	id := s.playerID(r)
-	if id == "" {
+	if id == "" || s.game.GetPlayer(id) == nil {
 		s.render(w, "join.html", nil)
 		return
 	}
-	p := s.game.GetPlayer(id)
-	if p == nil {
-		// cookie but server restart lost them; re-join
-		s.render(w, "join.html", nil)
-		return
-	}
-	view := s.game.PlayerView(id)
-	s.render(w, "player.html", view)
+	s.render(w, "player.html", s.game.PlayerView(id))
 }
 
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
@@ -150,7 +140,12 @@ func (s *Server) handleAnswer(w http.ResponseWriter, r *http.Request) {
 	}
 	song := strings.TrimSpace(r.FormValue("song"))
 	artist := strings.TrimSpace(r.FormValue("artist"))
-	s.game.SubmitAnswer(id, song, artist)
+	if s.game.SubmitAnswer(id, song, artist) {
+		// Round just closed — pause playback so admin can reveal.
+		if err := s.spotify.Pause(); err != nil {
+			log.Printf("spotify pause: %v", err)
+		}
+	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -177,9 +172,8 @@ func (s *Server) isAdmin(r *http.Request) bool {
 	return c.Value == s.adminToken
 }
 
-// On first admin visit from any browser, auto-set the admin cookie. Since the
-// server is run locally for a family game, whoever reaches /admin first owns
-// the session. To rotate, restart the server.
+// ensureAdmin auto-sets the admin cookie for the first browser to reach /admin.
+// Restart the server to rotate.
 func (s *Server) ensureAdmin(w http.ResponseWriter, r *http.Request) {
 	if s.isAdmin(r) {
 		return
@@ -198,12 +192,11 @@ func (s *Server) ensureAdmin(w http.ResponseWriter, r *http.Request) {
 }
 
 type adminPageData struct {
-	Authorized bool
+	Authorized  bool
 	RedirectURI string
-	Playlists  []SpotifyPlaylist
-	Devices    []SpotifyDevice
-	View       AdminView
-	Err        string
+	View        AdminView
+	Err         string
+	Flash       string
 }
 
 func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
@@ -212,20 +205,10 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		Authorized:  s.spotify.Authorized(),
 		RedirectURI: s.cfg.RedirectURI,
 		View:        s.game.AdminView(),
+		Err:         r.URL.Query().Get("err"),
+		Flash:       r.URL.Query().Get("flash"),
 	}
 	data.View.Authorized = data.Authorized
-	if data.Authorized {
-		if pls, err := s.spotify.ListPlaylists(); err == nil {
-			data.Playlists = pls
-		} else {
-			data.Err = "playlists: " + err.Error()
-		}
-		if devs, err := s.spotify.Devices(); err == nil {
-			data.Devices = devs
-		} else if data.Err == "" {
-			data.Err = "devices: " + err.Error()
-		}
-	}
 	s.render(w, "admin.html", data)
 }
 
@@ -263,59 +246,43 @@ func (s *Server) handleAdminCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
-func (s *Server) handleSelectPlaylist(w http.ResponseWriter, r *http.Request) {
-	if !s.isAdmin(r) || r.Method != http.MethodPost {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	id := r.FormValue("playlist_id")
-	name := r.FormValue("playlist_name")
-	if id == "" {
-		http.Error(w, "playlist_id required", http.StatusBadRequest)
-		return
-	}
-	tracks, err := s.spotify.PlaylistTracks(id)
-	if err != nil {
-		http.Error(w, "load playlist: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	if len(tracks) == 0 {
-		http.Error(w, "playlist has no playable tracks", http.StatusBadRequest)
-		return
-	}
-	s.game.SetPlaylist(id, name, tracks)
-	http.Redirect(w, r, "/admin", http.StatusSeeOther)
-}
-
-func (s *Server) handleSelectDevice(w http.ResponseWriter, r *http.Request) {
-	if !s.isAdmin(r) || r.Method != http.MethodPost {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	id := r.FormValue("device_id")
-	name := r.FormValue("device_name")
-	s.game.SetDevice(id, name)
-	http.Redirect(w, r, "/admin", http.StatusSeeOther)
-}
-
 func (s *Server) handleStartRound(w http.ResponseWriter, r *http.Request) {
 	if !s.isAdmin(r) || r.Method != http.MethodPost {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	track, err := s.game.StartRound()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+
+	// On rounds 2+, skip to the next track first so the song is fresh.
+	if s.game.HasPreviousRound() {
+		if err := s.spotify.Next(); err != nil {
+			s.adminError(w, r, "Couldn't skip to the next song: "+err.Error()+" — make sure Spotify is open and playing on a device.")
+			return
+		}
+	}
+	// Make sure playback is actually running.
+	if err := s.spotify.Play(); err != nil {
+		s.adminError(w, r, "Couldn't start playback: "+err.Error()+" — open Spotify, start your playlist (shuffle recommended), then try again.")
 		return
 	}
-	// fetch device id from game
-	view := s.game.AdminView()
-	if err := s.spotify.PlayTrack(view.DeviceID, track.URI); err != nil {
-		// don't fail the round — admin can retry playback, but log it
-		log.Printf("spotify play error: %v", err)
-		http.Error(w, "round started but Spotify play failed: "+err.Error()+"\n(pick a device and make sure Spotify is running)", http.StatusBadGateway)
+
+	// Poll currently-playing until we see a track that isn't the previous one.
+	prevURI := s.game.CurrentTrackURI()
+	var track *SpotifyTrack
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		cp, err := s.spotify.CurrentlyPlaying()
+		if err == nil && cp != nil && cp.Item != nil && cp.Item.URI != "" && cp.Item.URI != prevURI {
+			track = cp.Item
+			break
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+	if track == nil {
+		s.adminError(w, r, "Spotify didn't report a track playing within a few seconds. Make sure a playlist is playing on your phone (or another device) and try again.")
 		return
 	}
+
+	s.game.StartRound(*track)
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
@@ -325,9 +292,8 @@ func (s *Server) handleEndRound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.game.EndRound()
-	view := s.game.AdminView()
-	if err := s.spotify.Pause(view.DeviceID); err != nil {
-		log.Printf("spotify pause error: %v", err)
+	if err := s.spotify.Pause(); err != nil {
+		log.Printf("spotify pause: %v", err)
 	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
@@ -338,6 +304,11 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.streamEvents(w, r, func() any { return s.game.AdminView() }, "admin", false)
+}
+
+func (s *Server) adminError(w http.ResponseWriter, r *http.Request, msg string) {
+	log.Printf("admin: %s", msg)
+	http.Redirect(w, r, "/admin?err="+url.QueryEscape(msg), http.StatusSeeOther)
 }
 
 // --- SSE helper ---
@@ -399,3 +370,4 @@ func randomHex(n int) string {
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
+

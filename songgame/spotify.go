@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const spotifyScopes = "user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private playlist-read-collaborative"
+const spotifyScopes = "user-read-playback-state user-modify-playback-state user-read-currently-playing"
 
 type SpotifyClient struct {
 	clientID     string
@@ -151,6 +151,9 @@ func (s *SpotifyClient) do(method, path string, body any, out any) error {
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == 204 {
+		return nil
+	}
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("spotify %s %s: %d %s", method, path, resp.StatusCode, data)
 	}
@@ -158,60 +161,6 @@ func (s *SpotifyClient) do(method, path string, body any, out any) error {
 		return json.Unmarshal(data, out)
 	}
 	return nil
-}
-
-type SpotifyPlaylist struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Owner struct {
-		ID          string `json:"id"`
-		DisplayName string `json:"display_name"`
-	} `json:"owner"`
-	Collaborative bool `json:"collaborative"`
-	Tracks        struct {
-		Total int `json:"total"`
-	} `json:"tracks"`
-}
-
-func (s *SpotifyClient) Me() (string, error) {
-	var out struct {
-		ID string `json:"id"`
-	}
-	if err := s.do("GET", "/me", nil, &out); err != nil {
-		return "", err
-	}
-	return out.ID, nil
-}
-
-// ListPlaylists returns playlists the user owns or collaborates on. Playlists
-// owned by Spotify (editorial/algorithmic, like Daily Mixes or Discover Weekly)
-// are excluded because Dev Mode apps can't read their contents as of Feb 2026.
-func (s *SpotifyClient) ListPlaylists() ([]SpotifyPlaylist, error) {
-	me, err := s.Me()
-	if err != nil {
-		return nil, err
-	}
-	var all []SpotifyPlaylist
-	next := "/me/playlists?limit=50"
-	for next != "" {
-		var page struct {
-			Items []SpotifyPlaylist `json:"items"`
-			Next  string            `json:"next"`
-		}
-		if err := s.do("GET", next, nil, &page); err != nil {
-			return nil, err
-		}
-		for _, p := range page.Items {
-			if p.Owner.ID == me || p.Collaborative {
-				all = append(all, p)
-			}
-		}
-		if page.Next == "" {
-			break
-		}
-		next = strings.TrimPrefix(page.Next, "https://api.spotify.com/v1")
-	}
-	return all, nil
 }
 
 type SpotifyTrack struct {
@@ -231,69 +180,63 @@ func (t SpotifyTrack) ArtistNames() []string {
 	return names
 }
 
-func (s *SpotifyClient) PlaylistTracks(id string) ([]SpotifyTrack, error) {
-	var out []SpotifyTrack
-	next := "/playlists/" + id + "/tracks?limit=100&fields=next,items(track(id,uri,name,artists(name),type))"
-	for next != "" {
-		var page struct {
-			Items []struct {
-				Track *struct {
-					SpotifyTrack
-					Type string `json:"type"`
-				} `json:"track"`
-			} `json:"items"`
-			Next string `json:"next"`
-		}
-		if err := s.do("GET", next, nil, &page); err != nil {
-			return nil, err
-		}
-		for _, it := range page.Items {
-			if it.Track == nil || it.Track.Type != "track" || it.Track.ID == "" {
-				continue
-			}
-			out = append(out, it.Track.SpotifyTrack)
-		}
-		if page.Next == "" {
-			break
-		}
-		next = strings.TrimPrefix(page.Next, "https://api.spotify.com/v1")
-	}
-	return out, nil
+type CurrentlyPlaying struct {
+	IsPlaying bool          `json:"is_playing"`
+	Item      *SpotifyTrack `json:"item"`
+	Device    *struct {
+		Name string `json:"name"`
+		Type string `json:"type"`
+	} `json:"device"`
 }
 
-type SpotifyDevice struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Type     string `json:"type"`
-	IsActive bool   `json:"is_active"`
-}
-
-func (s *SpotifyClient) Devices() ([]SpotifyDevice, error) {
-	var out struct {
-		Devices []SpotifyDevice `json:"devices"`
-	}
-	if err := s.do("GET", "/me/player/devices", nil, &out); err != nil {
+// CurrentlyPlaying returns what Spotify is currently playing, or nil if nothing is active.
+func (s *SpotifyClient) CurrentlyPlaying() (*CurrentlyPlaying, error) {
+	if err := s.refreshIfNeeded(); err != nil {
 		return nil, err
 	}
-	return out.Devices, nil
+	req, _ := http.NewRequest("GET", "https://api.spotify.com/v1/me/player/currently-playing", nil)
+	s.mu.Lock()
+	req.Header.Set("Authorization", "Bearer "+s.accessToken)
+	s.mu.Unlock()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	// 204 = nothing playing
+	if resp.StatusCode == 204 {
+		return nil, nil
+	}
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("currently-playing: %d %s", resp.StatusCode, data)
+	}
+	var cp CurrentlyPlaying
+	if err := json.Unmarshal(data, &cp); err != nil {
+		return nil, err
+	}
+	return &cp, nil
 }
 
-func (s *SpotifyClient) PlayTrack(deviceID, trackURI string) error {
-	path := "/me/player/play"
-	if deviceID != "" {
-		path += "?device_id=" + url.QueryEscape(deviceID)
-	}
-	body := map[string]any{"uris": []string{trackURI}}
-	return s.do("PUT", path, body, nil)
+// Next skips to the next track on whichever device is currently active.
+func (s *SpotifyClient) Next() error {
+	return s.do("POST", "/me/player/next", nil, nil)
 }
 
-func (s *SpotifyClient) Pause(deviceID string) error {
-	path := "/me/player/pause"
-	if deviceID != "" {
-		path += "?device_id=" + url.QueryEscape(deviceID)
+// Play resumes playback on whichever device is currently active.
+func (s *SpotifyClient) Play() error {
+	err := s.do("PUT", "/me/player/play", nil, nil)
+	// 403 "Restriction violated" can mean already playing — benign
+	if err != nil && strings.Contains(err.Error(), "403") {
+		return nil
 	}
-	err := s.do("PUT", path, nil, nil)
-	// 403 "Player command failed: Restriction violated" happens when already paused — ignore
+	return err
+}
+
+// Pause pauses playback on whichever device is currently active.
+func (s *SpotifyClient) Pause() error {
+	err := s.do("PUT", "/me/player/pause", nil, nil)
+	// 403 typically means already paused — benign
 	if err != nil && strings.Contains(err.Error(), "403") {
 		return nil
 	}
