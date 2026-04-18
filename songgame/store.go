@@ -9,18 +9,26 @@ import (
 	"time"
 )
 
-// Store persists Game state to a JSON file. Writes are debounced via a
+// Snapshotter is implemented by anything that can be persisted and restored.
+// Server implements it to combine game state with the admin token and the
+// Spotify refresh token into a single state file.
+type Snapshotter interface {
+	Snapshot() StateSnapshot
+	RestoreState(StateSnapshot)
+}
+
+// Store persists state to a JSON file. Writes are debounced via a
 // dirty flag that a background loop flushes on an interval.
 type Store struct {
 	path string
-	game *Game
+	src  Snapshotter
 
 	mu    sync.Mutex
 	dirty atomic.Bool
 }
 
-func NewStore(path string, g *Game) *Store {
-	return &Store{path: path, game: g}
+func NewStore(path string, src Snapshotter) *Store {
+	return &Store{path: path, src: src}
 }
 
 // MarkDirty signals that state has changed since the last save.
@@ -40,15 +48,16 @@ func (s *Store) Load() error {
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return err
 	}
-	s.game.Restore(snap)
+	s.src.RestoreState(snap)
 	return nil
 }
 
-// Save writes the current game state atomically (temp file + rename).
+// Save writes the current state atomically (temp file + rename). Mode 0600
+// because the file contains a Spotify refresh token.
 func (s *Store) Save() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	snap := s.game.Snapshot()
+	snap := s.src.Snapshot()
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return err

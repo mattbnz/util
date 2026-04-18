@@ -185,6 +185,12 @@ type StateSnapshot struct {
 	GraceDurationS   int          `json:"grace_duration_s"`
 	ResultsDurationS int          `json:"results_duration_s"`
 	PrevRound        *RoundResult `json:"prev_round,omitempty"`
+
+	// Server-level persistence: the admin token (so the shared URL survives
+	// restarts) and the Spotify refresh token (so the host doesn't have to
+	// re-authenticate). Populated via Server.Snapshot, ignored by Game.
+	AdminToken          string `json:"admin_token,omitempty"`
+	SpotifyRefreshToken string `json:"spotify_refresh_token,omitempty"`
 }
 
 func (g *Game) Snapshot() StateSnapshot {
@@ -203,9 +209,9 @@ func (g *Game) Snapshot() StateSnapshot {
 	}
 }
 
-// Restore applies a previously-saved snapshot. Should only be called before
-// the game starts serving traffic.
-func (g *Game) Restore(s StateSnapshot) {
+// RestoreState applies a previously-saved snapshot. Should only be called
+// before the game starts serving traffic.
+func (g *Game) RestoreState(s StateSnapshot) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if s.GraceDurationS > 0 {

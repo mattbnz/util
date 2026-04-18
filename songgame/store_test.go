@@ -49,6 +49,45 @@ func TestStoreRoundTripPlayersAndDurations(t *testing.T) {
 	}
 }
 
+func TestServerSnapshotPersistsAdminTokenAndSpotifyRefreshToken(t *testing.T) {
+	src := NewServer(ServerConfig{
+		ClientID:     "id",
+		ClientSecret: "secret",
+		RedirectURI:  "http://127.0.0.1/x",
+		BaseURL:      "http://127.0.0.1",
+	})
+	srcToken := src.AdminToken() // capture the auto-generated token
+	src.Spotify().LoadRefreshToken("rt-abcdef")
+
+	snap := src.Snapshot()
+	if snap.AdminToken != srcToken {
+		t.Fatalf("snapshot admin token: got %q, want %q", snap.AdminToken, srcToken)
+	}
+	if snap.SpotifyRefreshToken != "rt-abcdef" {
+		t.Fatalf("snapshot spotify refresh token: got %q", snap.SpotifyRefreshToken)
+	}
+
+	dst := NewServer(ServerConfig{
+		ClientID:     "id",
+		ClientSecret: "secret",
+		RedirectURI:  "http://127.0.0.1/x",
+		BaseURL:      "http://127.0.0.1",
+	})
+	if dst.AdminToken() == srcToken {
+		t.Fatalf("preflight: dst should have a different auto-generated token")
+	}
+	dst.RestoreState(snap)
+	if dst.AdminToken() != srcToken {
+		t.Errorf("admin token after restore: got %q, want %q", dst.AdminToken(), srcToken)
+	}
+	if dst.Spotify().RefreshToken() != "rt-abcdef" {
+		t.Errorf("spotify refresh after restore: got %q", dst.Spotify().RefreshToken())
+	}
+	if !dst.Spotify().Authorized() {
+		t.Errorf("Authorized should be true after restoring a refresh token")
+	}
+}
+
 func TestStoreLoadMissingFileIsNotError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "does-not-exist.json")

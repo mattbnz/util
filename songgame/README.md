@@ -55,10 +55,11 @@ Flags:
   `-redirect-base http://192.168.x.x:8080` **and** add that exact URI to your
   Spotify app's Redirect URIs.
 - `-state` path to the JSON state file, default `songgame-state.json`. Players,
-  scores, round number, and the configurable durations are saved on every
-  change (debounced by 2 seconds) and flushed on SIGINT/SIGTERM. Pass an empty
-  string to disable persistence. Spotify tokens are **not** persisted — log in
-  again after a restart.
+  scores, round number, configurable durations, the admin token, and the
+  Spotify refresh token are saved on every change (debounced by 2 seconds)
+  and flushed on SIGINT/SIGTERM. Pass an empty string to disable persistence.
+  The file is written with mode 0600 because the Spotify refresh token
+  functions as a credential; keep it on a disk you control.
 
 ## Settings
 
@@ -115,7 +116,6 @@ round was opened), the admin page has tools to recover:
 
 ## Limitations
 
-- Spotify auth doesn't persist — you'll need to re-log-in after a restart.
 - One game at a time.
 - Spotify's `currently-playing` endpoint can be a second or two stale after a
   skip; the server polls for up to ~4s to catch the new track.

@@ -37,7 +37,7 @@ func main() {
 	var store *Store
 	stopStore := make(chan struct{})
 	if *statePath != "" {
-		store = NewStore(*statePath, srv.Game())
+		store = NewStore(*statePath, srv)
 		if _, err := os.Stat(*statePath); err == nil {
 			if err := store.Load(); err != nil {
 				log.Printf("state load (%s): %v", *statePath, err)
@@ -48,6 +48,11 @@ func main() {
 			log.Printf("state file: %s (new)", *statePath)
 		}
 		srv.Game().SetChangeCallback(store.MarkDirty)
+		srv.Spotify().SetTokenCallback(store.MarkDirty)
+		// Force a save shortly after startup so freshly-generated values
+		// (like a new admin token when the state file was missing) make it
+		// to disk even if nothing else changes.
+		store.MarkDirty()
 		go store.Run(2*time.Second, stopStore)
 	}
 
@@ -55,7 +60,11 @@ func main() {
 	go srv.RunAutoResync(5*time.Second, stopAutoResync)
 
 	log.Printf("songgame listening on %s", *addr)
+	log.Printf("admin URL (share with whoever should host): %s", srv.AdminURL())
 	log.Printf("players join at: %s/", *redirectBase)
+	if srv.Spotify().Authorized() {
+		log.Printf("spotify: restored refresh token from state")
+	}
 
 	httpSrv := &http.Server{Addr: *addr, Handler: srv}
 	go func() {

@@ -21,20 +21,51 @@ type SpotifyClient struct {
 	clientSecret string
 	redirectURI  string
 
-	mu           sync.Mutex
-	accessToken  string
-	refreshToken string
-	expiresAt    time.Time
+	mu            sync.Mutex
+	accessToken   string
+	refreshToken  string
+	expiresAt     time.Time
+	onTokenChange func()
 }
 
 func NewSpotifyClient(id, secret, redirect string) *SpotifyClient {
 	return &SpotifyClient{clientID: id, clientSecret: secret, redirectURI: redirect}
 }
 
+// SetTokenCallback registers a hook that fires whenever the stored refresh
+// token changes (OAuth exchange, token refresh, or clearing on invalid_grant).
+// Used by the persistent store to mark itself dirty so the new token is saved.
+func (s *SpotifyClient) SetTokenCallback(fn func()) {
+	s.mu.Lock()
+	s.onTokenChange = fn
+	s.mu.Unlock()
+}
+
 func (s *SpotifyClient) Authorized() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.refreshToken != ""
+}
+
+// RefreshToken returns the stored refresh token (for persistence).
+func (s *SpotifyClient) RefreshToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.refreshToken
+}
+
+// LoadRefreshToken seeds the client with a previously-persisted refresh token.
+// The access token and expiry are cleared so the next API call triggers a
+// refresh using this refresh token. A no-op if empty.
+func (s *SpotifyClient) LoadRefreshToken(rt string) {
+	if rt == "" {
+		return
+	}
+	s.mu.Lock()
+	s.refreshToken = rt
+	s.accessToken = ""
+	s.expiresAt = time.Time{}
+	s.mu.Unlock()
 }
 
 func (s *SpotifyClient) AuthURL(state string) string {
@@ -78,7 +109,11 @@ func (s *SpotifyClient) ExchangeCode(code string) error {
 	s.accessToken = tok.AccessToken
 	s.refreshToken = tok.RefreshToken
 	s.expiresAt = time.Now().Add(time.Duration(tok.ExpiresIn-30) * time.Second)
+	cb := s.onTokenChange
 	s.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
 	return nil
 }
 
@@ -107,6 +142,21 @@ func (s *SpotifyClient) refreshIfNeeded() error {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
+	// 400 from the refresh endpoint almost always means the refresh token has
+	// been revoked/expired. Clear our cached credentials so Authorized()
+	// returns false and the admin is prompted to log in again.
+	if resp.StatusCode == 400 {
+		s.mu.Lock()
+		s.accessToken = ""
+		s.refreshToken = ""
+		s.expiresAt = time.Time{}
+		cb := s.onTokenChange
+		s.mu.Unlock()
+		if cb != nil {
+			cb()
+		}
+		return fmt.Errorf("refresh failed (%d): %s (re-login needed)", resp.StatusCode, body)
+	}
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("refresh failed (%d): %s", resp.StatusCode, body)
 	}
@@ -124,7 +174,11 @@ func (s *SpotifyClient) refreshIfNeeded() error {
 		s.refreshToken = tok.RefreshToken
 	}
 	s.expiresAt = time.Now().Add(time.Duration(tok.ExpiresIn-30) * time.Second)
+	cb := s.onTokenChange
 	s.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
 	return nil
 }
 

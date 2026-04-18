@@ -56,7 +56,6 @@ func NewServer(cfg ServerConfig) *Server {
 		tpl:     tpl,
 	}
 	s.adminToken = randomHex(16)
-	log.Printf("admin URL (share with whoever should host): %s/admin?t=%s", cfg.BaseURL, s.adminToken)
 	s.game.SetCallbacks(s.onRoundEnd, s.onAutoAdvance)
 	return s
 }
@@ -64,11 +63,47 @@ func NewServer(cfg ServerConfig) *Server {
 // Game exposes the underlying game for wiring up storage/callbacks at startup.
 func (s *Server) Game() *Game { return s.game }
 
+// AdminToken returns the current admin token (for tests and logging).
+func (s *Server) AdminToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.adminToken
+}
+
+// Spotify exposes the Spotify client so main.go can wire up the token-change
+// callback for persistence.
+func (s *Server) Spotify() *SpotifyClient { return s.spotify }
+
 // AdminURL returns the shareable URL that claims admin access.
 func (s *Server) AdminURL() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cfg.BaseURL + "/admin?t=" + s.adminToken
+}
+
+// Snapshot captures everything that should survive a restart: game state,
+// the admin token, and Spotify's refresh token (the access token is
+// deliberately not persisted — it'll be refreshed on next use).
+func (s *Server) Snapshot() StateSnapshot {
+	snap := s.game.Snapshot()
+	s.mu.Lock()
+	snap.AdminToken = s.adminToken
+	s.mu.Unlock()
+	snap.SpotifyRefreshToken = s.spotify.RefreshToken()
+	return snap
+}
+
+// RestoreState applies a previously-saved snapshot at startup. If the
+// snapshot carried an admin token or Spotify refresh token, the values
+// generated in NewServer are replaced.
+func (s *Server) RestoreState(snap StateSnapshot) {
+	s.game.RestoreState(snap)
+	if snap.AdminToken != "" {
+		s.mu.Lock()
+		s.adminToken = snap.AdminToken
+		s.mu.Unlock()
+	}
+	s.spotify.LoadRefreshToken(snap.SpotifyRefreshToken)
 }
 
 func (s *Server) onRoundEnd() {
