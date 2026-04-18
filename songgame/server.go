@@ -346,6 +346,62 @@ func (s *Server) handleStartRound(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
+// RunAutoResync periodically polls Spotify's playback state and, if an active
+// round's expected track has drifted from what Spotify is actually playing
+// across two consecutive observations, updates the round's track and re-grades
+// the submitted answers. Blocks until stop is closed.
+func (s *Server) RunAutoResync(interval time.Duration, stop <-chan struct{}) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	var observedURI string
+	var observedCount int
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+		}
+		if !s.spotify.Authorized() || !s.game.HasActiveRound() {
+			observedURI = ""
+			observedCount = 0
+			continue
+		}
+		expected := s.game.CurrentTrackURI()
+		st, err := s.spotify.PlaybackStatus()
+		if err != nil {
+			continue
+		}
+		if st == nil || st.Raw204 || st.TrackURI == "" || st.TrackURI == expected {
+			observedURI = ""
+			observedCount = 0
+			continue
+		}
+		// Mismatch — require persistence across two polls to ride out the
+		// brief staleness Spotify reports right after a skip.
+		if observedURI == st.TrackURI {
+			observedCount++
+		} else {
+			observedURI = st.TrackURI
+			observedCount = 1
+		}
+		if observedCount < 2 {
+			continue
+		}
+		track, ok := st.AsTrack()
+		if !ok {
+			observedURI = ""
+			observedCount = 0
+			continue
+		}
+		if s.game.UpdateRoundTrack(track) {
+			log.Printf("auto-resync: round track updated to %q by %v (was out of sync for 2 polls)",
+				track.Name, track.ArtistNames())
+		}
+		observedURI = ""
+		observedCount = 0
+	}
+}
+
 func (s *Server) handleSpotifyStatus(w http.ResponseWriter, r *http.Request) {
 	if !s.isAdmin(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)

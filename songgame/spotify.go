@@ -264,6 +264,21 @@ type PlaybackStatus struct {
 	Raw204        bool     `json:"raw_204"` // true when Spotify returned "no playback session" (204)
 }
 
+// AsTrack builds a SpotifyTrack from the status, for use with Game.UpdateRoundTrack.
+// Returns (nil, false) if there's no usable track info.
+func (p *PlaybackStatus) AsTrack() (SpotifyTrack, bool) {
+	if p == nil || p.TrackURI == "" {
+		return SpotifyTrack{}, false
+	}
+	t := SpotifyTrack{URI: p.TrackURI, Name: p.TrackName}
+	for _, a := range p.TrackArtists {
+		t.Artists = append(t.Artists, struct {
+			Name string `json:"name"`
+		}{Name: a})
+	}
+	return t, true
+}
+
 // PlaybackStatus returns a richer view of the current Spotify player state.
 func (s *SpotifyClient) PlaybackStatus() (*PlaybackStatus, error) {
 	if err := s.refreshIfNeeded(); err != nil {

@@ -51,6 +51,9 @@ func main() {
 		go store.Run(2*time.Second, stopStore)
 	}
 
+	stopAutoResync := make(chan struct{})
+	go srv.RunAutoResync(5*time.Second, stopAutoResync)
+
 	log.Printf("songgame listening on %s", *addr)
 	log.Printf("players join at: %s/", *redirectBase)
 
@@ -69,6 +72,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(ctx)
+	close(stopAutoResync)
 	if store != nil {
 		close(stopStore)
 		// best-effort final save; the Run loop's final flush handles normal cases,
