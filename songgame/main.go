@@ -18,10 +18,29 @@ func main() {
 	statePath := flag.String("state", "songgame-state.json", "path to state file (set empty to disable persistence)")
 	flag.Parse()
 
+	// Read any existing state first, so we can fall back to cached Spotify
+	// credentials when the env vars aren't set. The rest of the snapshot is
+	// applied to the Server after it's constructed, below.
+	var cached *StateSnapshot
+	if *statePath != "" {
+		snap, err := ReadSnapshot(*statePath)
+		if err != nil {
+			log.Printf("state read (%s): %v", *statePath, err)
+		}
+		cached = snap
+	}
+
 	clientID := os.Getenv("SPOTIFY_CLIENT_ID")
 	clientSecret := os.Getenv("SPOTIFY_CLIENT_SECRET")
+	if clientID == "" && cached != nil {
+		clientID = cached.SpotifyClientID
+	}
+	if clientSecret == "" && cached != nil {
+		clientSecret = cached.SpotifyClientSecret
+	}
 	if clientID == "" || clientSecret == "" {
-		fmt.Fprintln(os.Stderr, "SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET env vars are required.")
+		fmt.Fprintln(os.Stderr, "Spotify credentials not found. Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET")
+		fmt.Fprintln(os.Stderr, "on the first run; they will be cached in the state file for subsequent starts.")
 		fmt.Fprintln(os.Stderr, "Register an app at https://developer.spotify.com/dashboard and add redirect URI:")
 		fmt.Fprintln(os.Stderr, "  "+*redirectBase+"/admin/callback")
 		os.Exit(1)
@@ -38,12 +57,9 @@ func main() {
 	stopStore := make(chan struct{})
 	if *statePath != "" {
 		store = NewStore(*statePath, srv)
-		if _, err := os.Stat(*statePath); err == nil {
-			if err := store.Load(); err != nil {
-				log.Printf("state load (%s): %v", *statePath, err)
-			} else {
-				log.Printf("state loaded from %s", *statePath)
-			}
+		if cached != nil {
+			srv.RestoreState(*cached)
+			log.Printf("state loaded from %s", *statePath)
 		} else {
 			log.Printf("state file: %s (new)", *statePath)
 		}

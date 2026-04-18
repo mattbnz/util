@@ -37,19 +37,30 @@ func (s *Store) MarkDirty() { s.dirty.Store(true) }
 // Load reads the state file (if present) and applies it to the game.
 // A missing file is not an error.
 func (s *Store) Load() error {
-	data, err := os.ReadFile(s.path)
+	snap, err := ReadSnapshot(s.path)
+	if err != nil || snap == nil {
+		return err
+	}
+	s.src.RestoreState(*snap)
+	return nil
+}
+
+// ReadSnapshot reads a state file into a StateSnapshot without applying it
+// anywhere. main.go uses this to read the cached Spotify credentials before
+// constructing the Server. Returns (nil, nil) when the file doesn't exist.
+func ReadSnapshot(path string) (*StateSnapshot, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return nil, nil
 		}
-		return err
+		return nil, err
 	}
 	var snap StateSnapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
-		return err
+		return nil, err
 	}
-	s.src.RestoreState(snap)
-	return nil
+	return &snap, nil
 }
 
 // Save writes the current state atomically (temp file + rename). Mode 0600

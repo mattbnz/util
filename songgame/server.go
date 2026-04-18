@@ -102,6 +102,8 @@ func (s *Server) Snapshot() StateSnapshot {
 	snap := s.game.Snapshot()
 	s.mu.Lock()
 	snap.AdminToken = s.adminToken
+	snap.SpotifyClientID = s.cfg.ClientID
+	snap.SpotifyClientSecret = s.cfg.ClientSecret
 	s.mu.Unlock()
 	snap.SpotifyRefreshToken = s.spotify.RefreshToken()
 	return snap

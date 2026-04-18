@@ -211,10 +211,14 @@ type StateSnapshot struct {
 	History   []*GameRecord  `json:"history,omitempty"`
 
 	// Server-level persistence: the admin token (so the shared URL survives
-	// restarts) and the Spotify refresh token (so the host doesn't have to
-	// re-authenticate). Populated via Server.Snapshot, ignored by Game.
+	// restarts), the Spotify refresh token (so the host doesn't have to
+	// re-authenticate), and the Spotify dev-app credentials (so the
+	// env vars only need to be supplied once). Populated via
+	// Server.Snapshot, ignored by Game.
 	AdminToken          string `json:"admin_token,omitempty"`
 	SpotifyRefreshToken string `json:"spotify_refresh_token,omitempty"`
+	SpotifyClientID     string `json:"spotify_client_id,omitempty"`
+	SpotifyClientSecret string `json:"spotify_client_secret,omitempty"`
 }
 
 func (g *Game) Snapshot() StateSnapshot {

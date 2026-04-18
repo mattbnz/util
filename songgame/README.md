@@ -46,6 +46,10 @@ export SPOTIFY_CLIENT_SECRET=...
 go run .
 ```
 
+The client id and secret are cached in the state file after the first run,
+so subsequent starts can omit the env vars. Export them again only if you
+need to switch dev apps.
+
 Flags:
 
 - `-addr` listen address, default `:8080`
