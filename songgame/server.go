@@ -759,8 +759,8 @@ func (s *Server) handleEndRound(w http.ResponseWriter, r *http.Request) {
 func (s *Server) advanceToNextRound() error {
 	prevURI := s.game.CurrentTrackURI() // non-empty only if a completed round is still around
 	if prevURI != "" {
-		if err := s.spotify.Next(s.SelectedDeviceID()); err != nil {
-			return fmt.Errorf("couldn't skip to the next song: %v — make sure Spotify is open and playing on the selected device", err)
+		if err := s.spotify.Next(); err != nil {
+			return fmt.Errorf("couldn't skip to the next song: %v — make sure Spotify is open and playing on a device", err)
 		}
 	}
 	s.game.BeginPrepRound(prevURI)
