@@ -317,12 +317,19 @@ func (s *SpotifyClient) Devices() ([]SpotifyDevice, error) {
 	return out.Devices, nil
 }
 
-// Next skips to the next track. If deviceID is non-empty, the skip is
-// targeted at that specific Spotify Connect device.
+// Next skips to the next track. If deviceID is non-empty, the skip is first
+// attempted against that specific Spotify Connect device; some endpoints
+// (e.g. third-party Connect devices like AV receivers) reject device-targeted
+// commands with 403 "Restriction violated", so on that failure we transparently
+// fall back to an implicit skip on the currently-active device.
 func (s *SpotifyClient) Next(deviceID string) error {
-	path := "/me/player/next"
-	if deviceID != "" {
-		path += "?device_id=" + url.QueryEscape(deviceID)
+	if deviceID == "" {
+		return s.do("POST", "/me/player/next", nil, nil)
 	}
-	return s.do("POST", path, nil, nil)
+	err := s.do("POST", "/me/player/next?device_id="+url.QueryEscape(deviceID), nil, nil)
+	if err != nil && strings.Contains(err.Error(), "403") {
+		log.Printf("next: device-targeted skip rejected (403); retrying without device_id")
+		return s.do("POST", "/me/player/next", nil, nil)
+	}
+	return err
 }
