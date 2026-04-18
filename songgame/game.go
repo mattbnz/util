@@ -266,6 +266,27 @@ func (g *Game) CurrentTrackURI() string {
 	return g.Round.Track.URI
 }
 
+// UpdateRoundTrack swaps the active round's track and re-grades any answers
+// already submitted. Used by the admin resync action when Spotify is playing
+// a different track than the round was opened with.
+func (g *Game) UpdateRoundTrack(track SpotifyTrack) (updated bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.Round == nil || g.Round.Ended {
+		return false
+	}
+	if g.Round.Track.URI == track.URI {
+		return false
+	}
+	g.Round.Track = track
+	for _, ans := range g.Round.Answers {
+		ans.SongCorrect = fuzzyMatch(ans.SongGuess, track.Name)
+		ans.ArtistCorrect = matchAnyArtist(ans.ArtistGuess, track.ArtistNames())
+	}
+	go g.notify()
+	return true
+}
+
 // StartRound opens a new round for the given track. Cancels any pending
 // auto-advance so a manual start beats the timer cleanly.
 func (g *Game) StartRound(track SpotifyTrack) {

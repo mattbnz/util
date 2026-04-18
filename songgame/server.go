@@ -137,6 +137,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleEndRound(w, r)
 	case "/admin/config":
 		s.handleConfig(w, r)
+	case "/admin/spotify-status":
+		s.handleSpotifyStatus(w, r)
+	case "/admin/resync":
+		s.handleResync(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -338,6 +342,67 @@ func (s *Server) handleStartRound(w http.ResponseWriter, r *http.Request) {
 	if err := s.advanceToNextRound(); err != nil {
 		s.adminError(w, r, err.Error())
 		return
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+func (s *Server) handleSpotifyStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	type resp struct {
+		Status         *PlaybackStatus `json:"status"`
+		Error          string          `json:"error,omitempty"`
+		RoundActive    bool            `json:"round_active"`
+		RoundTrackURI  string          `json:"round_track_uri"`
+		RoundTrackName string          `json:"round_track_name"`
+		Mismatch       bool            `json:"mismatch"`
+	}
+	out := resp{}
+	st, err := s.spotify.PlaybackStatus()
+	if err != nil {
+		out.Error = err.Error()
+	} else {
+		out.Status = st
+	}
+	s.game.mu.Lock()
+	if s.game.Round != nil && !s.game.Round.Ended {
+		out.RoundActive = true
+		out.RoundTrackURI = s.game.Round.Track.URI
+		out.RoundTrackName = s.game.Round.Track.Name
+	}
+	s.game.mu.Unlock()
+	if out.RoundActive && out.Status != nil && out.Status.TrackURI != "" && out.Status.TrackURI != out.RoundTrackURI {
+		out.Mismatch = true
+	}
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) || r.Method != http.MethodPost {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	cp, err := s.spotify.CurrentlyPlaying()
+	if err != nil {
+		s.adminError(w, r, "Resync failed: couldn't read currently-playing: "+err.Error())
+		return
+	}
+	if cp == nil || cp.Item == nil || cp.Item.URI == "" {
+		s.adminError(w, r, "Resync failed: Spotify isn't reporting a track. Start playback first.")
+		return
+	}
+	if !s.game.HasActiveRound() {
+		s.adminError(w, r, "Resync needs an active round. Use Start next round for a fresh one.")
+		return
+	}
+	updated := s.game.UpdateRoundTrack(*cp.Item)
+	if updated {
+		log.Printf("resync: updated round track to %q by %v", cp.Item.Name, cp.Item.ArtistNames())
+	} else {
+		log.Printf("resync: no change; round track already matches Spotify")
 	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }

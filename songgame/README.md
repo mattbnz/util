@@ -93,6 +93,22 @@ stripped, leading `the`/`a`/`an` stripped, punctuation removed. A small edit
 distance is allowed (so "bohemian rhapsod" still counts). For artists,
 matching any one artist of a multi-artist track is enough.
 
+## Debugging Spotify sync issues
+
+If the round's expected track drifts from what's actually playing (e.g. you
+transferred Spotify Connect to a different device, or the API lagged when the
+round was opened), the admin page has tools to recover:
+
+- The **Spotify playback state** card polls `/me/player` every few seconds
+  and shows the active device, volume, play/pause state, shuffle flag, and
+  the track Spotify *thinks* is playing with progress. If that track doesn't
+  match the round's expected track you'll see a red mismatch warning.
+- The **Resync with Spotify** button re-reads currently-playing, swaps it in
+  as the round's answer, and re-grades every guess already submitted.
+- Every Spotify API call is logged with method, path, status code, and
+  duration; error bodies are included on 4xx/5xx. Run the server in a
+  terminal and tail the output while you debug.
+
 ## Limitations
 
 - Spotify auth doesn't persist — you'll need to re-log-in after a restart.

@@ -85,6 +85,20 @@
       </div>
     </div>
 
+    <div class="card">
+      <h3 style="margin-top:0">Spotify playback state</h3>
+      <div id="spotifyStatus">
+        <p class="muted" id="spotifyStatusLine">loading…</p>
+        <p id="spotifyMismatch" class="err" style="display:none; margin:0.3rem 0; padding:0.3rem 0.6rem; border-radius:4px; background:#fdecea;"></p>
+        <div style="margin-top:0.5rem;">
+          <form method="post" action="/admin/resync" style="display:inline;">
+            <button type="submit" class="secondary" title="Read currently-playing from Spotify and update the round's expected track">Resync with Spotify</button>
+          </form>
+          <span class="muted" style="font-size:0.85rem; margin-left:0.5rem;">updates every few seconds</span>
+        </div>
+      </div>
+    </div>
+
     {{with .View}}
     <div class="card">
       <h3>
@@ -220,6 +234,51 @@
     } catch (err) { /* ignore */ }
   };
   es.onerror = function(){ setTimeout(function(){ if (last === null) location.reload(); }, 5000); };
+
+  // Spotify status poller — refreshes every 4 seconds to surface device/state
+  // info and warn when Spotify is playing a track different from the round.
+  function fmtMS(ms){
+    if (!ms || ms < 0) ms = 0;
+    var s = Math.floor(ms/1000);
+    return Math.floor(s/60) + ":" + String(s%60).padStart(2,'0');
+  }
+  function renderStatus(r){
+    var line = document.getElementById('spotifyStatusLine');
+    var warn = document.getElementById('spotifyMismatch');
+    if (!line || !warn) return;
+    if (r.error) {
+      line.innerHTML = '<span style="color:#c33">Spotify error:</span> ' + r.error;
+      warn.style.display = 'none';
+      return;
+    }
+    var s = r.status;
+    if (!s || s.raw_204 || !s.device_id) {
+      line.innerHTML = '<em>No active Spotify device.</em> Open Spotify on your phone or laptop and start playing.';
+      warn.style.display = 'none';
+      return;
+    }
+    var bits = [];
+    bits.push('<strong>' + (s.device_name || '?') + '</strong> <span class="muted">(' + (s.device_type || '?') + ', vol ' + (s.volume_percent||0) + '%'+ (s.is_playing ? ', playing' : ', paused') + (s.shuffle ? ', shuffle' : '') + ')</span>');
+    if (s.track_name) {
+      var artists = (s.track_artists || []).join(', ');
+      bits.push('<br>Spotify: <strong>' + s.track_name + '</strong> — ' + artists + ' <span class="muted">(' + fmtMS(s.progress_ms) + ' / ' + fmtMS(s.duration_ms) + ')</span>');
+    }
+    line.innerHTML = bits.join('');
+    if (r.mismatch) {
+      warn.textContent = 'Mismatch: round expects "' + (r.round_track_name || r.round_track_uri) + '" but Spotify is playing "' + (s.track_name || '?') + '". Click Resync to update.';
+      warn.style.display = '';
+    } else {
+      warn.style.display = 'none';
+    }
+  }
+  function pollStatus(){
+    fetch('/admin/spotify-status', {credentials:'same-origin'})
+      .then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(renderStatus)
+      .catch(function(){ /* ignore transient errors */ });
+  }
+  pollStatus();
+  setInterval(pollStatus, 4000);
 })();
 </script>
 </body>

@@ -104,6 +104,54 @@ func TestStartRoundCancelsAutoAdvanceTimer(t *testing.T) {
 	}
 }
 
+func TestUpdateRoundTrackRegradesAnswers(t *testing.T) {
+	g := NewGame()
+	g.AddOrUpdatePlayer("a", "Alice")
+	g.AddOrUpdatePlayer("b", "Bob")
+	g.AddOrUpdatePlayer("c", "Carol") // never answers — keeps the round from auto-closing
+	g.StartRound(track("t1", "Imagine", "John Lennon"))
+
+	// Alice guesses the actually-playing song; Bob guesses something that won't match either track.
+	g.SubmitAnswer("a", "Yesterday", "The Beatles")
+	g.SubmitAnswer("b", "completely wrong", "someone else")
+
+	v := g.AdminView()
+	for _, a := range v.Answers {
+		if a.SongCorrect || a.ArtistCorrect {
+			t.Fatalf("before resync, no answer should be graded correct: %+v", a)
+		}
+	}
+
+	// Admin resyncs: the track Spotify is actually playing was Yesterday by The Beatles.
+	updated := g.UpdateRoundTrack(track("t2", "Yesterday", "The Beatles"))
+	if !updated {
+		t.Fatalf("UpdateRoundTrack should report an update")
+	}
+
+	v = g.AdminView()
+	var alice, bob *Answer
+	for _, a := range v.Answers {
+		if a.PlayerID == "a" {
+			alice = a
+		} else if a.PlayerID == "b" {
+			bob = a
+		}
+	}
+	if alice == nil || !alice.SongCorrect || !alice.ArtistCorrect {
+		t.Errorf("Alice's correct guess should be marked correct after resync: %+v", alice)
+	}
+	if bob == nil || bob.SongCorrect || bob.ArtistCorrect {
+		t.Errorf("Bob's wrong guess should still be wrong: %+v", bob)
+	}
+}
+
+func TestUpdateRoundTrackRefusesWhenNoActiveRound(t *testing.T) {
+	g := NewGame()
+	if g.UpdateRoundTrack(track("x", "Song", "Artist")) {
+		t.Fatalf("UpdateRoundTrack should return false when no round is active")
+	}
+}
+
 func TestPrevRoundCapturedOnEndAndPersistsIntoNextRound(t *testing.T) {
 	g := NewGame()
 	g.AddOrUpdatePlayer("a", "Alice")

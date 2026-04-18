@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -127,6 +128,25 @@ func (s *SpotifyClient) refreshIfNeeded() error {
 	return nil
 }
 
+// logCall writes a single-line trace of a Spotify API call to help debug
+// playback / sync issues. Status 0 indicates a network error before a response.
+func logCall(method, path string, status int, dur time.Duration, errBody string) {
+	d := dur.Round(time.Millisecond)
+	if status == 0 {
+		log.Printf("spotify %s %s → network error in %v: %s", method, path, d, errBody)
+		return
+	}
+	if status >= 400 {
+		trimmed := errBody
+		if len(trimmed) > 240 {
+			trimmed = trimmed[:240] + "…"
+		}
+		log.Printf("spotify %s %s → %d in %v: %s", method, path, status, d, trimmed)
+		return
+	}
+	log.Printf("spotify %s %s → %d in %v", method, path, status, d)
+}
+
 func (s *SpotifyClient) do(method, path string, body any, out any) error {
 	if err := s.refreshIfNeeded(); err != nil {
 		return err
@@ -146,12 +166,15 @@ func (s *SpotifyClient) do(method, path string, body any, out any) error {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		logCall(method, path, 0, time.Since(start), err.Error())
 		return err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
+	logCall(method, path, resp.StatusCode, time.Since(start), string(data))
 	if resp.StatusCode == 204 {
 		return nil
 	}
@@ -199,16 +222,19 @@ func (s *SpotifyClient) CurrentlyPlaying() (*CurrentlyPlaying, error) {
 	s.mu.Lock()
 	req.Header.Set("Authorization", "Bearer "+s.accessToken)
 	s.mu.Unlock()
+	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		logCall("GET", "/me/player/currently-playing", 0, time.Since(start), err.Error())
 		return nil, err
 	}
 	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	logCall("GET", "/me/player/currently-playing", resp.StatusCode, time.Since(start), string(data))
 	// 204 = nothing playing
 	if resp.StatusCode == 204 {
 		return nil, nil
 	}
-	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("currently-playing: %d %s", resp.StatusCode, data)
 	}
@@ -217,6 +243,97 @@ func (s *SpotifyClient) CurrentlyPlaying() (*CurrentlyPlaying, error) {
 		return nil, err
 	}
 	return &cp, nil
+}
+
+// PlaybackStatus is a richer snapshot of /me/player, exposed to the admin UI
+// so the host can debug device/state mismatches.
+type PlaybackStatus struct {
+	DeviceID      string   `json:"device_id"`
+	DeviceName    string   `json:"device_name"`
+	DeviceType    string   `json:"device_type"`
+	VolumePercent int      `json:"volume_percent"`
+	IsActive      bool     `json:"is_active"`
+	IsPlaying     bool     `json:"is_playing"`
+	Shuffle       bool     `json:"shuffle"`
+	RepeatState   string   `json:"repeat_state"`
+	TrackURI      string   `json:"track_uri"`
+	TrackName     string   `json:"track_name"`
+	TrackArtists  []string `json:"track_artists"`
+	ProgressMS    int      `json:"progress_ms"`
+	DurationMS    int      `json:"duration_ms"`
+	Raw204        bool     `json:"raw_204"` // true when Spotify returned "no playback session" (204)
+}
+
+// PlaybackStatus returns a richer view of the current Spotify player state.
+func (s *SpotifyClient) PlaybackStatus() (*PlaybackStatus, error) {
+	if err := s.refreshIfNeeded(); err != nil {
+		return nil, err
+	}
+	req, _ := http.NewRequest("GET", "https://api.spotify.com/v1/me/player", nil)
+	s.mu.Lock()
+	req.Header.Set("Authorization", "Bearer "+s.accessToken)
+	s.mu.Unlock()
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		logCall("GET", "/me/player", 0, time.Since(start), err.Error())
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	logCall("GET", "/me/player", resp.StatusCode, time.Since(start), string(data))
+	if resp.StatusCode == 204 {
+		return &PlaybackStatus{Raw204: true}, nil
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("player: %d %s", resp.StatusCode, data)
+	}
+	var raw struct {
+		Device *struct {
+			ID            string `json:"id"`
+			Name          string `json:"name"`
+			Type          string `json:"type"`
+			VolumePercent int    `json:"volume_percent"`
+			IsActive      bool   `json:"is_active"`
+		} `json:"device"`
+		ShuffleState bool   `json:"shuffle_state"`
+		RepeatState  string `json:"repeat_state"`
+		IsPlaying    bool   `json:"is_playing"`
+		ProgressMS   int    `json:"progress_ms"`
+		Item         *struct {
+			URI        string `json:"uri"`
+			Name       string `json:"name"`
+			DurationMS int    `json:"duration_ms"`
+			Artists    []struct {
+				Name string `json:"name"`
+			} `json:"artists"`
+		} `json:"item"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	st := &PlaybackStatus{
+		IsPlaying:   raw.IsPlaying,
+		Shuffle:     raw.ShuffleState,
+		RepeatState: raw.RepeatState,
+		ProgressMS:  raw.ProgressMS,
+	}
+	if raw.Device != nil {
+		st.DeviceID = raw.Device.ID
+		st.DeviceName = raw.Device.Name
+		st.DeviceType = raw.Device.Type
+		st.VolumePercent = raw.Device.VolumePercent
+		st.IsActive = raw.Device.IsActive
+	}
+	if raw.Item != nil {
+		st.TrackURI = raw.Item.URI
+		st.TrackName = raw.Item.Name
+		st.DurationMS = raw.Item.DurationMS
+		for _, a := range raw.Item.Artists {
+			st.TrackArtists = append(st.TrackArtists, a.Name)
+		}
+	}
+	return st, nil
 }
 
 // Next skips to the next track on whichever device is currently active.
@@ -246,37 +363,14 @@ func (s *SpotifyClient) Pause() error {
 
 // DeviceVolume returns the active device's volume (0-100), or -1 if unknown.
 func (s *SpotifyClient) DeviceVolume() (int, error) {
-	if err := s.refreshIfNeeded(); err != nil {
-		return -1, err
-	}
-	req, _ := http.NewRequest("GET", "https://api.spotify.com/v1/me/player", nil)
-	s.mu.Lock()
-	req.Header.Set("Authorization", "Bearer "+s.accessToken)
-	s.mu.Unlock()
-	resp, err := http.DefaultClient.Do(req)
+	st, err := s.PlaybackStatus()
 	if err != nil {
 		return -1, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == 204 {
-		return -1, nil // nothing playing
-	}
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return -1, fmt.Errorf("player: %d %s", resp.StatusCode, data)
-	}
-	var pb struct {
-		Device *struct {
-			VolumePercent int `json:"volume_percent"`
-		} `json:"device"`
-	}
-	if err := json.Unmarshal(data, &pb); err != nil {
-		return -1, err
-	}
-	if pb.Device == nil {
+	if st == nil || st.Raw204 || st.DeviceID == "" {
 		return -1, nil
 	}
-	return pb.Device.VolumePercent, nil
+	return st.VolumePercent, nil
 }
 
 // SetVolume sets the active device's volume (0-100). Not all devices support
