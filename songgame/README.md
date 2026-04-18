@@ -114,6 +114,25 @@ round was opened), the admin page has tools to recover:
   duration; error bodies are included on 4xx/5xx. Run the server in a
   terminal and tail the output while you debug.
 
+## Games and history
+
+The app tracks explicit *game sessions*. A game starts the first time you
+click "Start round 1" and runs until you click **End game** on the admin
+page, which:
+
+- archives the current game (all rounds + each player's final score) to the
+  Previous games card,
+- zeroes every player's score,
+- clears the round history for the new game.
+
+Players stay across game boundaries — no one has to re-join. Each archived
+game is expandable in the admin UI to show round-by-round guesses with
+correctness marks. Archived games are persisted in the state file.
+
+The admin scoreboard also has an **Eject** button next to each player. It
+removes them from the current game (and discards their in-flight answer, if
+any). Their presence in already-archived games isn't affected.
+
 ## Limitations
 
 - One game at a time.

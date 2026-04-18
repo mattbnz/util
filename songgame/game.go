@@ -53,6 +53,16 @@ type RoundResult struct {
 	Answers []*Answer `json:"answers"`
 }
 
+// GameRecord is an archived, completed game session: all the rounds that were
+// played, plus each player's final score at the moment the game ended.
+type GameRecord struct {
+	ID        string         `json:"id"`
+	StartedAt time.Time      `json:"started_at"`
+	EndedAt   time.Time      `json:"ended_at"`
+	Players   []Player       `json:"players"`
+	Rounds    []*RoundResult `json:"rounds"`
+}
+
 // LiveAnswer is a narrow view of an in-progress answer, exposed to players
 // who have already submitted. Correctness is deliberately omitted so watching
 // the live feed doesn't leak the right answer.
@@ -66,10 +76,18 @@ type LiveAnswer struct {
 type Game struct {
 	mu sync.Mutex
 
+	// Active game lifecycle — GameID/StartedAt are set on the first round of
+	// a game session and cleared when the session is archived to History.
+	GameID    string
+	StartedAt time.Time
+
 	Round     *Round
-	PrevRound *RoundResult
-	Players   map[string]*Player
-	Number    int
+	Rounds    []*RoundResult // all completed rounds in the current game session
+	PrevRound *RoundResult   // convenience pointer to the most recent completed round
+	History   []*GameRecord  // archived, finished games
+
+	Players map[string]*Player
+	Number  int
 
 	graceDuration   time.Duration
 	resultsDuration time.Duration
@@ -186,6 +204,12 @@ type StateSnapshot struct {
 	ResultsDurationS int          `json:"results_duration_s"`
 	PrevRound        *RoundResult `json:"prev_round,omitempty"`
 
+	// Game session lifecycle.
+	GameID    string         `json:"game_id,omitempty"`
+	StartedAt time.Time      `json:"started_at,omitempty"`
+	Rounds    []*RoundResult `json:"rounds,omitempty"`
+	History   []*GameRecord  `json:"history,omitempty"`
+
 	// Server-level persistence: the admin token (so the shared URL survives
 	// restarts) and the Spotify refresh token (so the host doesn't have to
 	// re-authenticate). Populated via Server.Snapshot, ignored by Game.
@@ -206,6 +230,10 @@ func (g *Game) Snapshot() StateSnapshot {
 		GraceDurationS:   int(g.graceDuration / time.Second),
 		ResultsDurationS: int(g.resultsDuration / time.Second),
 		PrevRound:        g.PrevRound,
+		GameID:           g.GameID,
+		StartedAt:        g.StartedAt,
+		Rounds:           append([]*RoundResult{}, g.Rounds...),
+		History:          append([]*GameRecord{}, g.History...),
 	}
 }
 
@@ -229,8 +257,20 @@ func (g *Game) RestoreState(s StateSnapshot) {
 		pp := p
 		g.Players[p.ID] = &pp
 	}
+	g.GameID = s.GameID
+	g.StartedAt = s.StartedAt
+	if len(s.Rounds) > 0 {
+		g.Rounds = append(g.Rounds, s.Rounds...)
+	}
+	if len(s.History) > 0 {
+		g.History = append(g.History, s.History...)
+	}
+	// PrevRound defaults to the last completed round if the snapshot didn't
+	// carry it explicitly.
 	if s.PrevRound != nil {
 		g.PrevRound = s.PrevRound
+	} else if len(g.Rounds) > 0 {
+		g.PrevRound = g.Rounds[len(g.Rounds)-1]
 	}
 }
 
@@ -304,13 +344,18 @@ func (g *Game) UpdateRoundTrack(track SpotifyTrack) (updated bool) {
 }
 
 // StartRound opens a new round for the given track. Cancels any pending
-// auto-advance so a manual start beats the timer cleanly.
+// auto-advance so a manual start beats the timer cleanly. Starts a fresh
+// game session (GameID/StartedAt) if none is active.
 func (g *Game) StartRound(track SpotifyTrack) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.autoAdvanceTimer != nil {
 		g.autoAdvanceTimer.Stop()
 		g.autoAdvanceTimer = nil
+	}
+	if g.GameID == "" {
+		g.GameID = randomGameID()
+		g.StartedAt = time.Now()
 	}
 	g.Number++
 	g.Round = &Round{
@@ -321,6 +366,69 @@ func (g *Game) StartRound(track SpotifyTrack) {
 	}
 	go g.notify()
 }
+
+// EndGame archives the current game session to History and resets live state
+// (scores, rounds, active round). Players are preserved across the transition
+// so they don't have to re-join, but all scores return to zero. Safe to call
+// when no game is active — it's a no-op then.
+func (g *Game) EndGame() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.GameID == "" && len(g.Rounds) == 0 && (g.Round == nil || g.Round.Ended) {
+		return
+	}
+	// End any live round first so it counts toward the archive.
+	if g.Round != nil && !g.Round.Ended {
+		g.endRoundLocked()
+	}
+	if g.autoAdvanceTimer != nil {
+		g.autoAdvanceTimer.Stop()
+		g.autoAdvanceTimer = nil
+	}
+	// Snapshot players with their final scores into the archive.
+	players := make([]Player, 0, len(g.Players))
+	for _, p := range g.Players {
+		players = append(players, *p)
+	}
+	g.History = append(g.History, &GameRecord{
+		ID:        g.GameID,
+		StartedAt: g.StartedAt,
+		EndedAt:   time.Now(),
+		Players:   players,
+		Rounds:    append([]*RoundResult{}, g.Rounds...),
+	})
+	// Reset the live state.
+	g.GameID = ""
+	g.StartedAt = time.Time{}
+	g.Rounds = nil
+	g.PrevRound = nil
+	g.Round = nil
+	g.Number = 0
+	for _, p := range g.Players {
+		p.Score = 0
+	}
+	go g.notify()
+}
+
+// EjectPlayer removes a player from the current game. If they'd submitted
+// an answer in the active round it's discarded so the counts stay consistent.
+// Their presence in any already-archived GameRecord is untouched.
+func (g *Game) EjectPlayer(playerID string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, ok := g.Players[playerID]; !ok {
+		return false
+	}
+	delete(g.Players, playerID)
+	if g.Round != nil {
+		delete(g.Round.Answers, playerID)
+	}
+	go g.notify()
+	return true
+}
+
+// randomGameID produces a short human-friendly game id (8 hex chars).
+func randomGameID() string { return randomHex(4) }
 
 // CancelAutoAdvance stops any pending auto-advance timer. Used when the admin
 // manually starts the next round during the results period.
@@ -438,6 +546,7 @@ func (g *Game) endRoundLocked() {
 		return result.Answers[i].SubmittedAt.Before(result.Answers[j].SubmittedAt)
 	})
 	g.PrevRound = result
+	g.Rounds = append(g.Rounds, result)
 	if g.onAutoAdvance != nil {
 		g.autoAdvanceTimer = time.AfterFunc(g.resultsDuration, g.onAutoAdvance)
 	}
@@ -524,19 +633,22 @@ func (g *Game) PlayerView(playerID string) PlayerView {
 }
 
 type AdminView struct {
-	Authorized      bool         `json:"authorized"`
-	RoundNumber     int          `json:"round_number"`
-	RoundActive     bool         `json:"round_active"`
-	RoundEnded      bool         `json:"round_ended"`
-	CurrentSong     string       `json:"current_song"`
-	CurrentArtists  string       `json:"current_artists"`
-	AnswerCount     int          `json:"answer_count"`
-	PlayerCount     int          `json:"player_count"`
-	GraceUntilUnix  int64        `json:"grace_until,omitempty"`
-	AutoAdvanceUnix int64        `json:"auto_advance_at,omitempty"`
-	Answers         []*Answer    `json:"answers"`
-	Scoreboard      []*Player    `json:"scoreboard"`
-	PrevRound       *RoundResult `json:"prev_round,omitempty"`
+	Authorized      bool          `json:"authorized"`
+	GameID          string        `json:"game_id,omitempty"`
+	GameActive      bool          `json:"game_active"`
+	RoundNumber     int           `json:"round_number"`
+	RoundActive     bool          `json:"round_active"`
+	RoundEnded      bool          `json:"round_ended"`
+	CurrentSong     string        `json:"current_song"`
+	CurrentArtists  string        `json:"current_artists"`
+	AnswerCount     int           `json:"answer_count"`
+	PlayerCount     int           `json:"player_count"`
+	GraceUntilUnix  int64         `json:"grace_until,omitempty"`
+	AutoAdvanceUnix int64         `json:"auto_advance_at,omitempty"`
+	Answers         []*Answer     `json:"answers"`
+	Scoreboard      []*Player     `json:"scoreboard"`
+	PrevRound       *RoundResult  `json:"prev_round,omitempty"`
+	History         []*GameRecord `json:"history,omitempty"`
 }
 
 func (g *Game) AdminView() AdminView {
@@ -566,6 +678,16 @@ func (g *Game) AdminView() AdminView {
 	}
 	v.Scoreboard = g.playerListLocked()
 	v.PrevRound = g.PrevRound
+	v.GameID = g.GameID
+	v.GameActive = g.GameID != ""
+	// History most-recent-first, a copy so the caller can't mutate.
+	if len(g.History) > 0 {
+		rev := make([]*GameRecord, 0, len(g.History))
+		for i := len(g.History) - 1; i >= 0; i-- {
+			rev = append(rev, g.History[i])
+		}
+		v.History = rev
+	}
 	return v
 }
 

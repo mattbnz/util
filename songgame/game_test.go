@@ -186,6 +186,91 @@ func TestUpdateRoundTrackRefusesWhenNoActiveRound(t *testing.T) {
 	}
 }
 
+func TestEndGameArchivesAndResets(t *testing.T) {
+	g := NewGame()
+	g.AddOrUpdatePlayer("a", "Alice")
+	g.AddOrUpdatePlayer("b", "Bob")
+	g.StartRound(track("t1", "Imagine", "John Lennon"))
+	g.SubmitAnswer("a", "Imagine", "Lennon")
+	g.SubmitAnswer("b", "Imagine", "Lennon")
+	// Both answered → round closed. GameID is set by StartRound.
+	if g.GameID == "" {
+		t.Fatalf("GameID should be set after starting a round")
+	}
+	priorID := g.GameID
+
+	g.EndGame()
+
+	if g.GameID != "" {
+		t.Errorf("GameID should be cleared after EndGame, got %q", g.GameID)
+	}
+	if len(g.History) != 1 {
+		t.Fatalf("history should contain one record, got %d", len(g.History))
+	}
+	rec := g.History[0]
+	if rec.ID != priorID {
+		t.Errorf("archived game id: got %q, want %q", rec.ID, priorID)
+	}
+	if len(rec.Rounds) != 1 {
+		t.Errorf("archived record rounds: got %d, want 1", len(rec.Rounds))
+	}
+	if len(rec.Players) != 2 {
+		t.Errorf("archived record players: got %d, want 2", len(rec.Players))
+	}
+	for _, p := range g.Players {
+		if p.Score != 0 {
+			t.Errorf("player %s score should reset to 0, got %d", p.Name, p.Score)
+		}
+	}
+	if len(g.Rounds) != 0 {
+		t.Errorf("live rounds should be cleared, got %d", len(g.Rounds))
+	}
+	if g.Number != 0 {
+		t.Errorf("round number should reset to 0, got %d", g.Number)
+	}
+}
+
+func TestEjectPlayerRemovesFromPlayersAndActiveRound(t *testing.T) {
+	g := NewGame()
+	g.AddOrUpdatePlayer("a", "Alice")
+	g.AddOrUpdatePlayer("b", "Bob")
+	g.AddOrUpdatePlayer("c", "Carol")
+	g.StartRound(track("t1", "Imagine", "John Lennon"))
+	g.SubmitAnswer("a", "Imagine", "Lennon")
+
+	if !g.EjectPlayer("a") {
+		t.Fatalf("EjectPlayer should return true for a known player")
+	}
+	if _, ok := g.Players["a"]; ok {
+		t.Errorf("Alice should be gone from Players")
+	}
+	if g.Round == nil {
+		t.Fatalf("round should still be active")
+	}
+	if _, ok := g.Round.Answers["a"]; ok {
+		t.Errorf("Alice's answer should be removed from the active round")
+	}
+	if g.EjectPlayer("nonexistent") {
+		t.Errorf("EjectPlayer should return false for unknown id")
+	}
+}
+
+func TestStartRoundAssignsGameIDOnce(t *testing.T) {
+	g := NewGame()
+	g.AddOrUpdatePlayer("a", "A")
+	g.StartRound(track("t1", "One", "X"))
+	first := g.GameID
+	if first == "" {
+		t.Fatalf("GameID should be set after first StartRound")
+	}
+	// End the round then start another; GameID must persist through the game.
+	g.EndRound()
+	g.StartRound(track("t2", "Two", "X"))
+	if g.GameID != first {
+		t.Errorf("GameID should remain %q across rounds of the same game, got %q", first, g.GameID)
+	}
+}
+
 func TestPrevRoundCapturedOnEndAndPersistsIntoNextRound(t *testing.T) {
 	g := NewGame()
 	g.AddOrUpdatePlayer("a", "Alice")

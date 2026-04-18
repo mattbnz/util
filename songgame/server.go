@@ -176,6 +176,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleSpotifyStatus(w, r)
 	case "/admin/resync":
 		s.handleResync(w, r)
+	case "/admin/end-game":
+		s.handleEndGame(w, r)
+	case "/admin/eject":
+		s.handleEject(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -494,6 +498,32 @@ func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
 		log.Printf("resync: updated round track to %q by %v", cp.Item.Name, cp.Item.ArtistNames())
 	} else {
 		log.Printf("resync: no change; round track already matches Spotify")
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+func (s *Server) handleEndGame(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) || r.Method != http.MethodPost {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	s.game.EndGame()
+	log.Printf("admin ended the current game; archived to history")
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+func (s *Server) handleEject(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) || r.Method != http.MethodPost {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	id := r.FormValue("player_id")
+	if id == "" {
+		http.Error(w, "player_id required", http.StatusBadRequest)
+		return
+	}
+	if s.game.EjectPlayer(id) {
+		log.Printf("admin ejected player %s", id)
 	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
