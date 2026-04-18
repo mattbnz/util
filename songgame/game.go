@@ -44,6 +44,7 @@ type Round struct {
 	Phase         string // prep | active | ended
 	Track         SpotifyTrack
 	Answers       map[string]*Answer
+	Drafts        map[string]*Draft // in-progress text from players who haven't formally submitted yet
 	PrepStartedAt time.Time
 	PrepPrevURI   string // URI that was playing before; prep waits for a different URI (skipped case)
 	StartedAt     time.Time
@@ -51,6 +52,16 @@ type Round struct {
 	Ended         bool // kept for backward-compat snapshots; = Phase==PhaseEnded
 	EndedAt       time.Time
 	AutoAdvanceAt time.Time
+}
+
+// Draft is an unsubmitted in-progress guess. Players' clients post drafts
+// periodically while typing; if the round ends before they hit Submit, the
+// most recent draft is promoted to a real Answer in endRoundLocked.
+type Draft struct {
+	PlayerName  string
+	SongGuess   string
+	ArtistGuess string
+	UpdatedAt   time.Time
 }
 
 // RoundResult is the persisted snapshot of a completed round, shown below the
@@ -580,6 +591,35 @@ func (g *Game) SubmitAnswer(playerID, songGuess, artistGuess string) bool {
 	return closed
 }
 
+// UpdateDraft records the latest in-progress text for a player who hasn't
+// formally submitted yet. Returns false (and does nothing) if the round isn't
+// active or the player already submitted. Doesn't notify subscribers — drafts
+// are private to the typing player.
+func (g *Game) UpdateDraft(playerID, songGuess, artistGuess string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.Round == nil || g.Round.Phase != PhaseActive {
+		return false
+	}
+	p, ok := g.Players[playerID]
+	if !ok {
+		return false
+	}
+	if _, already := g.Round.Answers[playerID]; already {
+		return false
+	}
+	if g.Round.Drafts == nil {
+		g.Round.Drafts = make(map[string]*Draft)
+	}
+	g.Round.Drafts[playerID] = &Draft{
+		PlayerName:  p.Name,
+		SongGuess:   songGuess,
+		ArtistGuess: artistGuess,
+		UpdatedAt:   time.Now(),
+	}
+	return true
+}
+
 // EndRound closes the active round immediately (used by admin "end now").
 func (g *Game) EndRound() bool {
 	g.mu.Lock()
@@ -613,6 +653,25 @@ func (g *Game) endRoundLocked() {
 	g.Round.Ended = true
 	g.Round.EndedAt = time.Now()
 	g.Round.AutoAdvanceAt = time.Now().Add(g.resultsDuration)
+	// Promote in-progress drafts from players who never explicitly submitted,
+	// so a half-typed guess still counts when the round ends suddenly.
+	for pid, d := range g.Round.Drafts {
+		if _, already := g.Round.Answers[pid]; already {
+			continue
+		}
+		if d.SongGuess == "" && d.ArtistGuess == "" {
+			continue
+		}
+		g.Round.Answers[pid] = &Answer{
+			PlayerID:      pid,
+			PlayerName:    d.PlayerName,
+			SongGuess:     d.SongGuess,
+			ArtistGuess:   d.ArtistGuess,
+			SongCorrect:   fuzzyMatch(d.SongGuess, g.Round.Track.Name),
+			ArtistCorrect: matchAnyArtist(d.ArtistGuess, g.Round.Track.ArtistNames()),
+			SubmittedAt:   d.UpdatedAt,
+		}
+	}
 	for _, ans := range g.Round.Answers {
 		p := g.Players[ans.PlayerID]
 		if p == nil {

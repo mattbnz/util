@@ -181,6 +181,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleJoin(w, r)
 	case "/answer":
 		s.handleAnswer(w, r)
+	case "/draft":
+		s.handleDraft(w, r)
 	case "/events":
 		s.handlePlayerEvents(w, r)
 	case "/admin":
@@ -262,6 +264,28 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	s.game.AddOrUpdatePlayer(id, name)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// handleDraft records the player's in-progress (untyped or partially-typed)
+// guess. Players' clients post this periodically while typing so a sudden
+// round-end (admin "End round now", last player submits, grace timeout)
+// doesn't lose their work — the latest draft is promoted to a real answer
+// when the round ends. Returns 204 unconditionally; called from background
+// fetch() so we don't redirect.
+func (s *Server) handleDraft(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := s.playerID(r)
+	if id == "" || s.game.GetPlayer(id) == nil {
+		http.Error(w, "not joined", http.StatusUnauthorized)
+		return
+	}
+	song := strings.TrimSpace(r.FormValue("song"))
+	artist := strings.TrimSpace(r.FormValue("artist"))
+	s.game.UpdateDraft(id, song, artist)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleAnswer(w http.ResponseWriter, r *http.Request) {
