@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Song game — admin</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 60rem; margin: 1.5rem auto; padding: 0 1rem; }
+  h1 { margin: 0 0 0.25rem 0; }
+  h3 { margin-bottom: 0.5rem; }
+  .card { border: 1px solid #ddd; border-radius: 6px; padding: 1rem; margin-bottom: 1rem; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 40rem) { .grid { grid-template-columns: 1fr; } }
+  button { padding: 0.6rem 1rem; font-size: 1rem; background: #1db954; color: white; border: 0; border-radius: 4px; cursor: pointer; }
+  button.secondary { background: #555; }
+  button.danger { background: #c33; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  form { display: inline-block; margin-right: 0.5rem; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #eee; font-size: 0.95rem; }
+  th { color: #666; font-size: 0.85rem; }
+  .muted { color: #888; }
+  .err { color: #c33; background: #fdecea; border-color: #f5c2bd; }
+  .pill { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; background: #eee; font-size: 0.8rem; }
+  .pill.active { background: #d6f5df; color: #0a6e2c; }
+  .pill.ended { background: #fbe3c1; color: #7a4910; }
+  .now { font-size: 1.2rem; font-weight: 600; }
+  .mark-ok { color: #1db954; font-weight: 600; }
+  .mark-no { color: #c33; }
+  .countdown { display: inline-block; margin-top: 0.5rem; padding: 0.3rem 0.6rem; background: #fdecea; color: #a22; border-radius: 4px; font-weight: 600; font-size: 0.95rem; }
+  .countdown.results { background: #e7f3fe; color: #14518b; }
+  .countdown[hidden] { display: none; }
+</style>
+</head>
+<body>
+  <h1>Song game — admin</h1>
+
+  {{if .Err}}<div class="card err">{{.Err}}</div>{{end}}
+
+  {{if not .Authorized}}
+    <div class="card">
+      <h3>Connect Spotify</h3>
+      <p>The server needs permission to control your Spotify playback.</p>
+      <p class="muted">Redirect URI registered with your Spotify app must be:<br><code>{{.RedirectURI}}</code></p>
+      <form method="get" action="/admin/login"><button type="submit">Log in with Spotify</button></form>
+    </div>
+  {{else}}
+    <div class="card">
+      <h3>How to play</h3>
+      <ol>
+        <li>On your phone (or any Spotify device), open a playlist and turn on <strong>shuffle</strong>, then hit play.</li>
+        <li>Come back here. Click <strong>Start next round</strong>: the server skips to the next song and records it as the round's answer.</li>
+        <li>Players answer at the root URL. The round ends once half have answered, or you click <strong>End round now</strong>.</li>
+      </ol>
+    </div>
+
+    <div class="card">
+      <h3>Settings</h3>
+      <form method="post" action="/admin/config" style="display:flex; flex-wrap:wrap; gap:1rem; align-items:flex-end;">
+        <label style="display:flex; flex-direction:column; gap:0.25rem;">
+          <span class="muted" style="font-size:0.85rem;">Grace period after 50% (seconds)</span>
+          <input type="number" name="grace_seconds" min="5" max="300" value="{{.GraceSeconds}}" style="padding:0.4rem; width:8rem;">
+        </label>
+        <label style="display:flex; flex-direction:column; gap:0.25rem;">
+          <span class="muted" style="font-size:0.85rem;">Results / auto-advance (seconds)</span>
+          <input type="number" name="results_seconds" min="5" max="300" value="{{.ResultsSeconds}}" style="padding:0.4rem; width:8rem;">
+        </label>
+        <button type="submit" class="secondary">Save</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h3>Share admin access</h3>
+      <p class="muted">Anyone with this link can control the game. Send it only to people you want to co-host.</p>
+      <div style="display:flex; gap:0.5rem; align-items:center;">
+        <input id="adminlink" type="text" readonly value="{{.AdminURL}}"
+               style="flex:1; padding:0.4rem; font-family:ui-monospace,monospace; font-size:0.85rem; border:1px solid #ccc; border-radius:4px;"
+               onclick="this.select()">
+        <button type="button" class="secondary" onclick="
+          var i=document.getElementById('adminlink'); i.select();
+          navigator.clipboard&&navigator.clipboard.writeText(i.value);
+          this.textContent='Copied';
+          setTimeout(function(){event.target.textContent='Copy';},1500);
+        ">Copy</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0">Spotify device</h3>
+      <p class="muted" style="font-size:0.85rem; margin:0;">Pick the device the game should target. Skip and currently-playing are scoped to it; reports from other devices are ignored. Leave unselected to follow whichever device is active.</p>
+      <form id="deviceForm" method="post" action="/admin/select-device" style="margin-top:0.5rem;">
+        <div id="deviceList"><p class="muted">loading devices…</p></div>
+        <div style="margin-top:0.5rem; display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+          <button type="submit" class="secondary">Use selected device</button>
+          <button type="submit" class="secondary" name="device_id" value="" title="Stop targeting a specific device">Clear selection</button>
+        </div>
+      </form>
+      <div style="margin-top:0.5rem; display:flex; gap:0.5rem; align-items:center;">
+        <form method="post" action="/admin/refresh-devices" style="display:inline;">
+          <button type="submit" class="secondary" title="Re-fetch the device list from Spotify now">Refresh devices</button>
+        </form>
+        <span id="devicesAge" class="muted" style="font-size:0.8rem;"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0">Spotify playback state</h3>
+      <div id="spotifyStatus">
+        <p class="muted" id="spotifyStatusLine">loading…</p>
+        <p id="spotifyMismatch" class="err" style="display:none; margin:0.3rem 0; padding:0.3rem 0.6rem; border-radius:4px; background:#fdecea;"></p>
+        <div style="margin-top:0.5rem;">
+          <form method="post" action="/admin/resync" style="display:inline;">
+            <button type="submit" class="secondary" title="Read currently-playing from Spotify and update the round's expected track">Resync with Spotify</button>
+          </form>
+          <span class="muted" style="font-size:0.85rem; margin-left:0.5rem;">auto-resyncs when a mismatch persists ~10s; hit the button to force it immediately</span>
+        </div>
+      </div>
+    </div>
+
+    {{with .View}}
+    <div class="card">
+      <h3>
+        Round {{if .RoundNumber}}{{.RoundNumber}}{{else}}—{{end}}
+        {{if .RoundPrep}}<span class="pill" style="background:#fef3c7; color:#92400e;">preparing…</span>{{else if .RoundActive}}<span class="pill active">playing</span>{{else if .RoundEnded}}<span class="pill ended">ended</span>{{end}}
+      </h3>
+      {{if .RoundPrep}}
+        <p class="muted">Waiting for Spotify to confirm the track. The round will flip to active automatically.</p>
+      {{else if .CurrentSong}}
+        <p class="now">{{.CurrentSong}} <span class="muted">— {{.CurrentArtists}}</span></p>
+      {{else}}
+        <p class="muted">No round in progress.</p>
+      {{end}}
+      <p class="muted">{{.AnswerCount}} of {{.PlayerCount}} players answered</p>
+      <div id="grace" class="countdown" data-deadline="{{.GraceUntilUnix}}" {{if not .GraceUntilUnix}}hidden{{end}}>
+        Grace period — round auto-ends in <span class="secs">—</span>s
+      </div>
+      <div id="advance" class="countdown results" data-deadline="{{.AutoAdvanceUnix}}" {{if not .AutoAdvanceUnix}}hidden{{end}}>
+        Next round auto-starts in <span class="secs">—</span>s
+      </div>
+      <div style="margin-top: 0.75rem;">
+        <form method="post" action="/admin/start-round">
+          <button type="submit" {{if .RoundPrep}}disabled{{end}}>
+            {{if .RoundPrep}}Preparing…{{else if not .GameActive}}Start game (round 1){{else if eq .RoundNumber 0}}Start round 1{{else if .RoundActive}}Skip to next round{{else}}Start next round now{{end}}
+          </button>
+        </form>
+        {{if .RoundActive}}
+        <form method="post" action="/admin/end-round">
+          <button type="submit" class="danger">End round now</button>
+        </form>
+        {{end}}
+        {{if .GameActive}}
+        <form method="post" action="/admin/end-game" onsubmit="return confirm('End this game and archive it to history? Scores reset to zero but players stay.');" style="margin-left:0.5rem;">
+          <button type="submit" class="danger" title="Archive the current game and reset scores to zero">End game</button>
+        </form>
+        {{end}}
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Answers this round</h3>
+        {{if .Answers}}
+        <table>
+          <tr><th>Player</th><th>Song</th><th>Artist</th></tr>
+          {{range .Answers}}
+          <tr>
+            <td>{{.PlayerName}}</td>
+            <td>{{.SongGuess}} {{if .SongCorrect}}<span class="mark-ok">✓</span>{{else}}<span class="mark-no">✗</span>{{end}}</td>
+            <td>{{.ArtistGuess}} {{if .ArtistCorrect}}<span class="mark-ok">✓</span>{{else}}<span class="mark-no">✗</span>{{end}}</td>
+          </tr>
+          {{end}}
+        </table>
+        {{else}}
+          <p class="muted">No answers yet.</p>
+        {{end}}
+      </div>
+
+      <div class="card">
+        <h3>Scoreboard</h3>
+        <table>
+          <tr><th>#</th><th>Player</th><th>Score</th><th></th></tr>
+          {{range $i, $p := .Scoreboard}}
+          <tr>
+            <td>{{inc $i}}</td><td>{{$p.Name}}</td><td>{{$p.Score}}</td>
+            <td>
+              <form method="post" action="/admin/eject"
+                    onsubmit="return confirm('Eject {{$p.Name}} from this game?');"
+                    style="display:inline;">
+                <input type="hidden" name="player_id" value="{{$p.ID}}">
+                <button type="submit" class="danger" style="padding:0.2rem 0.5rem; font-size:0.8rem;" title="Remove player from this game">Eject</button>
+              </form>
+            </td>
+          </tr>
+          {{end}}
+        </table>
+      </div>
+    </div>
+
+    {{if .History}}
+    <div class="card">
+      <h3 style="margin-top:0">Previous games</h3>
+      {{range .History}}
+      <details style="margin-bottom:0.5rem;">
+        <summary><strong>{{.StartedAt.Format "Jan 2 15:04"}}</strong> <span class="muted">— {{len .Rounds}} rounds, {{len .Players}} players</span></summary>
+        <div style="margin-top:0.5rem;">
+          <strong>Final scores:</strong>
+          <ul style="margin:0.25rem 0 0.5rem 1.25rem;">
+            {{range .Players}}<li>{{.Name}} — {{.Score}}</li>{{end}}
+          </ul>
+          {{range .Rounds}}
+          <div style="margin:0.5rem 0 0.5rem 0.5rem; padding:0.5rem; background:#fafafa; border-radius:4px;">
+            <strong>Round {{.Number}}:</strong> {{.Song}} <span class="muted">— {{.Artists}}</span>
+            {{if .Answers}}
+            <table style="margin-top:0.25rem;">
+              <tr><th>Player</th><th>Song guess</th><th>Artist guess</th></tr>
+              {{range .Answers}}
+              <tr>
+                <td>{{.PlayerName}}</td>
+                <td>{{.SongGuess}} {{if .SongCorrect}}<span class="mark-ok">✓</span>{{else}}<span class="mark-no">✗</span>{{end}}</td>
+                <td>{{.ArtistGuess}} {{if .ArtistCorrect}}<span class="mark-ok">✓</span>{{else}}<span class="mark-no">✗</span>{{end}}</td>
+              </tr>
+              {{end}}
+            </table>
+            {{else}}<p class="muted" style="margin:0.25rem 0 0 0;">Nobody answered.</p>{{end}}
+          </div>
+          {{end}}
+        </div>
+      </details>
+      {{end}}
+    </div>
+    {{end}}
+
+    {{with .PrevRound}}
+    <div class="card">
+      <h3 style="margin-top:0">Round {{.Number}} results</h3>
+      <p class="muted" style="margin-top:0">The song was <strong>{{.Song}}</strong> by <strong>{{.Artists}}</strong>.</p>
+      {{if .Answers}}
+      <table>
+        <tr><th>Player</th><th>Song guess</th><th>Artist guess</th></tr>
+        {{range .Answers}}
+        <tr>
+          <td>{{.PlayerName}}</td>
+          <td>{{.SongGuess}} {{if .SongCorrect}}<span class="mark-ok">✓</span>{{else}}<span class="mark-no">✗</span>{{end}}</td>
+          <td>{{.ArtistGuess}} {{if .ArtistCorrect}}<span class="mark-ok">✓</span>{{else}}<span class="mark-no">✗</span>{{end}}</td>
+        </tr>
+        {{end}}
+      </table>
+      {{else}}
+      <p class="muted">Nobody answered.</p>
+      {{end}}
+    </div>
+    {{end}}
+    {{end}}
+  {{end}}
+
+<script>
+(function(){
+  var last = null;
+
+  function setDeadline(id, unix) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    if (unix && unix > 0) {
+      el.dataset.deadline = String(unix);
+      el.hidden = false;
+    } else {
+      el.dataset.deadline = "0";
+      el.hidden = true;
+    }
+  }
+  function tick() {
+    document.querySelectorAll('.countdown').forEach(function(el){
+      if (el.hidden) return;
+      var t = parseInt(el.dataset.deadline, 10);
+      if (!t) return;
+      var sec = Math.max(0, t - Math.floor(Date.now()/1000));
+      var span = el.querySelector('.secs');
+      if (span) span.textContent = sec;
+    });
+  }
+  tick();
+  setInterval(tick, 1000);
+
+  var es = new EventSource("/admin/events");
+  es.onmessage = function(e){
+    try {
+      var v = JSON.parse(e.data);
+      if (last === null) { last = v; return; }
+      // In-place countdown update even when no full reload is warranted.
+      if (v.grace_until !== last.grace_until) setDeadline('grace', v.grace_until);
+      if (v.auto_advance_at !== last.auto_advance_at) setDeadline('advance', v.auto_advance_at);
+      var changed = (v.round_number !== last.round_number ||
+                     v.round_prep   !== last.round_prep   ||
+                     v.round_active !== last.round_active ||
+                     v.round_ended  !== last.round_ended  ||
+                     v.authorized   !== last.authorized   ||
+                     v.player_count !== last.player_count ||
+                     v.answer_count !== last.answer_count);
+      last = v;
+      if (!changed) return;
+      var ae = document.activeElement;
+      if (ae && (ae.tagName === "SELECT" || ae.tagName === "INPUT" || ae.tagName === "BUTTON")) return;
+      location.reload();
+    } catch (err) { /* ignore */ }
+  };
+  es.onerror = function(){ setTimeout(function(){ if (last === null) location.reload(); }, 5000); };
+
+  // Spotify status poller — refreshes every 4 seconds to surface what Spotify
+  // reports as currently-playing and warn when it differs from the round.
+  function escapeHTML(s){
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+      return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+    });
+  }
+  // Track which radio the user has manually selected so a re-render doesn't
+  // overwrite their pending choice between polls.
+  var pendingDeviceID = null;
+  function fmtAge(s){
+    if (s == null || s < 0) return '';
+    if (s < 60) return s + 's ago';
+    var m = Math.floor(s/60); var rem = s%60;
+    return m + 'm' + (rem ? ' ' + rem + 's' : '') + ' ago';
+  }
+  function renderDevices(r){
+    var box = document.getElementById('deviceList');
+    var age = document.getElementById('devicesAge');
+    if (!box) return;
+    if (age) {
+      age.textContent = (r.devices_age_seconds != null) ? 'device list refreshed ' + fmtAge(r.devices_age_seconds) : '';
+    }
+    if (r.devices_error) {
+      box.innerHTML = '<p class="err" style="margin:0; padding:0.3rem 0.6rem; border-radius:4px;">Couldn\'t list devices: ' + escapeHTML(r.devices_error) + '</p>';
+      return;
+    }
+    var devs = r.devices || [];
+    if (devs.length === 0) {
+      box.innerHTML = '<p class="muted" style="margin:0;">No devices visible. Open Spotify on a device, then click <strong>Refresh devices</strong>.</p>';
+      return;
+    }
+    var sel = pendingDeviceID;
+    if (sel === null) sel = r.selected_device_id || '';
+    var rows = devs.map(function(d){
+      var checked = (d.id === sel) ? ' checked' : '';
+      var badges = [];
+      if (d.is_active) badges.push('<span class="pill active">active</span>');
+      if (d.id && d.id === r.selected_device_id) badges.push('<span class="pill">selected</span>');
+      return '<label style="display:flex; gap:0.5rem; align-items:center; padding:0.3rem 0;">' +
+        '<input type="radio" name="device_id" value="' + escapeHTML(d.id) + '"' + checked + '>' +
+        '<span><strong>' + escapeHTML(d.name) + '</strong> <span class="muted">(' + escapeHTML(d.type) + ')</span> ' + badges.join(' ') + '</span>' +
+        '</label>';
+    });
+    box.innerHTML = rows.join('');
+  }
+  function renderStatus(r){
+    var line = document.getElementById('spotifyStatusLine');
+    var warn = document.getElementById('spotifyMismatch');
+    renderDevices(r);
+    if (!line || !warn) return;
+    if (r.error) {
+      line.innerHTML = '<span style="color:#c33">Spotify error:</span> ' + escapeHTML(r.error);
+      warn.style.display = 'none';
+      return;
+    }
+    var s = r.status;
+    if (!s || !s.track_uri) {
+      if (r.polled_at) {
+        line.innerHTML = '<em>Nothing currently playing on the targeted device.</em> Start playback on the device you selected above.';
+      } else {
+        line.innerHTML = '<em>Waiting for first playback poll…</em> (the poller idles when no round is active)';
+      }
+      warn.style.display = 'none';
+      return;
+    }
+    var bits = [];
+    if (s.device_name) {
+      bits.push('<strong>' + escapeHTML(s.device_name) + '</strong> <span class="muted">(' + escapeHTML(s.device_type || '?') + (s.is_playing ? ', playing' : ', paused') + ')</span>');
+    } else {
+      bits.push(s.is_playing ? 'Playing' : 'Paused');
+    }
+    var artists = (s.track_artists || []).join(', ');
+    bits.push('<br>Spotify: <strong>' + escapeHTML(s.track_name) + '</strong> — ' + escapeHTML(artists));
+    if (r.age_seconds >= 0) {
+      bits.push(' <span class="muted" style="font-size:0.8rem;">(last polled ' + r.age_seconds + 's ago)</span>');
+    }
+    line.innerHTML = bits.join('');
+    if (r.mismatch) {
+      warn.textContent = 'Mismatch: round expects "' + (r.round_track_name || r.round_track_uri) + '" but Spotify is playing "' + (s.track_name || '?') + '". Click Resync to update.';
+      warn.style.display = '';
+    } else {
+      warn.style.display = 'none';
+    }
+  }
+  document.addEventListener('change', function(e){
+    if (e.target && e.target.name === 'device_id') {
+      pendingDeviceID = e.target.value;
+    }
+  });
+  function pollStatus(){
+    fetch('/admin/spotify-status', {credentials:'same-origin'})
+      .then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(renderStatus)
+      .catch(function(){ /* ignore transient errors */ });
+  }
+  pollStatus();
+  setInterval(pollStatus, 4000);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Guess that song</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 1.5rem auto; padding: 0 1rem; }
+  h1 { margin: 0 0 0.25rem 0; }
+  .you { color: #666; margin-bottom: 1rem; }
+  .card { border: 1px solid #ddd; border-radius: 6px; padding: 1rem; margin-bottom: 1rem; }
+  .status { font-size: 1.1rem; font-weight: 600; }
+  .waiting { color: #888; }
+  .active { color: #1db954; }
+  .reveal { color: #b26a00; }
+  form { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.75rem; }
+  input[type=text] { padding: 0.6rem; font-size: 1rem; border: 1px solid #999; border-radius: 4px; }
+  button { padding: 0.6rem 1rem; font-size: 1rem; background: #1db954; color: white; border: 0; border-radius: 4px; cursor: pointer; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #eee; }
+  th { font-size: 0.85rem; color: #666; }
+  .me { font-weight: 600; }
+  .mark-ok { color: #1db954; font-weight: 600; }
+  .mark-no { color: #c33; }
+  .count { color: #666; font-size: 0.9rem; }
+  .countdown { display: inline-block; margin-top: 0.5rem; padding: 0.3rem 0.6rem; background: #fdecea; color: #a22; border-radius: 4px; font-weight: 600; font-size: 0.95rem; }
+  .countdown.results { background: #e7f3fe; color: #14518b; }
+  .countdown[hidden] { display: none; }
+</style>
+</head>
+<body data-you-id="{{if .You}}{{.You.ID}}{{end}}">
+  <h1>Guess that song</h1>
+  {{if .You}}<div class="you">Playing as <strong>{{.You.Name}}</strong></div>{{end}}
+
+  <div class="card" id="round">
+    {{if .RoundPrep}}
+      <div class="status waiting">Getting round {{.RoundNumber}} ready…</div>
+      <p class="muted">Waiting for Spotify to sync. You'll see the guessing form as soon as the song is confirmed.</p>
+    {{else if .RoundActive}}
+      <div class="status active">Round {{.RoundNumber}} — a song is playing!</div>
+      {{if .HasAnswered}}
+        <p>You answered. Waiting for others…</p>
+        <p class="count"><span class="answered">{{.AnswerCount}}</span> of <span class="players">{{.PlayerCount}}</span> players answered</p>
+      {{else}}
+        <form method="post" action="/answer">
+          <label>Song title <input type="text" name="song" autocomplete="off" autofocus required></label>
+          <label>Artist <input type="text" name="artist" autocomplete="off" required></label>
+          <button type="submit">Submit</button>
+        </form>
+        <p class="count"><span class="answered">{{.AnswerCount}}</span> of <span class="players">{{.PlayerCount}}</span> players answered so far</p>
+      {{end}}
+      <div id="grace" class="countdown" data-deadline="{{.GraceUntilUnix}}" {{if not .GraceUntilUnix}}hidden{{end}}>
+        Hurry! <span class="secs">—</span>s until the round auto-ends
+      </div>
+      <div id="liveAnswersWrap" {{if not .HasAnswered}}hidden{{end}} style="margin-top:0.75rem;">
+        <h4 style="margin:0.5rem 0 0.25rem 0; font-size:0.9rem; color:#666;">Guesses so far</h4>
+        <table>
+          <thead><tr><th>Player</th><th>Song</th><th>Artist</th></tr></thead>
+          <tbody id="liveAnswers">
+            {{range .LiveAnswers}}
+            <tr class="{{if and $.You (eq .PlayerID $.You.ID)}}me{{end}}">
+              <td>{{.PlayerName}}</td><td>{{.SongGuess}}</td><td>{{.ArtistGuess}}</td>
+            </tr>
+            {{end}}
+          </tbody>
+        </table>
+      </div>
+    {{else if .RoundEnded}}
+      <div class="status reveal">Round {{.RoundNumber}} ended</div>
+      <p>The song was <strong>{{.RevealSong}}</strong> by <strong>{{.RevealArtists}}</strong>.</p>
+      {{if .HasAnswered}}
+        <p>Your guess: <em>{{.YourSongGuess}}</em> by <em>{{.YourArtistGuess}}</em></p>
+        <p>Song: {{if .YourSongOK}}<span class="mark-ok">correct</span>{{else}}<span class="mark-no">nope</span>{{end}}
+           &nbsp;·&nbsp; Artist: {{if .YourArtistOK}}<span class="mark-ok">correct</span>{{else}}<span class="mark-no">nope</span>{{end}}</p>
+      {{else}}
+        <p>You didn't answer in time.</p>
+      {{end}}
+      <div id="advance" class="countdown results" data-deadline="{{.AutoAdvanceUnix}}" {{if not .AutoAdvanceUnix}}hidden{{end}}>
+        Next round in <span class="secs">—</span>s
+      </div>
+    {{else}}
+      <div class="status waiting">Waiting for the host to start a round…</div>
+    {{end}}
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">Scoreboard</h3>
+    <table>
+      <tr><th>#</th><th>Player</th><th>Score</th></tr>
+      {{range $i, $p := .Scoreboard}}
+      <tr class="{{if and $.You (eq $p.ID $.You.ID)}}me{{end}}">
+        <td>{{inc $i}}</td><td>{{$p.Name}}</td><td>{{$p.Score}}</td>
+      </tr>
+      {{end}}
+    </table>
+  </div>
+
+  {{with .PrevRound}}
+  <div class="card">
+    <h3 style="margin-top:0">Round {{.Number}} results</h3>
+    <p class="muted" style="margin-top:0">The song was <strong>{{.Song}}</strong> by <strong>{{.Artists}}</strong>.</p>
+    {{if .Answers}}
+    <table>
+      <tr><th>Player</th><th>Song guess</th><th>Artist guess</th></tr>
+      {{range .Answers}}
+      <tr class="{{if and $.You (eq .PlayerID $.You.ID)}}me{{end}}">
+        <td>{{.PlayerName}}</td>
+        <td>{{.SongGuess}} {{if .SongCorrect}}<span class="mark-ok">✓</span>{{else}}<span class="mark-no">✗</span>{{end}}</td>
+        <td>{{.ArtistGuess}} {{if .ArtistCorrect}}<span class="mark-ok">✓</span>{{else}}<span class="mark-no">✗</span>{{end}}</td>
+      </tr>
+      {{end}}
+    </table>
+    {{else}}
+    <p class="muted">Nobody answered.</p>
+    {{end}}
+  </div>
+  {{end}}
+
+<script>
+(function(){
+  var last = null;
+
+  var youID = document.body.dataset.youId || "";
+
+  function escapeHTML(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+
+  function renderLiveAnswers(list) {
+    var wrap = document.getElementById('liveAnswersWrap');
+    var tbody = document.getElementById('liveAnswers');
+    if (!wrap || !tbody) return;
+    if (!list || list.length === 0) {
+      wrap.hidden = true;
+      tbody.innerHTML = '';
+      return;
+    }
+    wrap.hidden = false;
+    var html = '';
+    for (var i = 0; i < list.length; i++) {
+      var a = list[i];
+      var meCls = (youID && a.player_id === youID) ? ' class="me"' : '';
+      html += '<tr' + meCls + '><td>' + escapeHTML(a.player_name)
+           + '</td><td>' + escapeHTML(a.song_guess)
+           + '</td><td>' + escapeHTML(a.artist_guess) + '</td></tr>';
+    }
+    tbody.innerHTML = html;
+  }
+
+  function setDeadline(id, unix) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    if (unix && unix > 0) {
+      el.dataset.deadline = String(unix);
+      el.hidden = false;
+    } else {
+      el.dataset.deadline = "0";
+      el.hidden = true;
+    }
+  }
+
+  function tick() {
+    document.querySelectorAll('.countdown').forEach(function(el){
+      if (el.hidden) return;
+      var t = parseInt(el.dataset.deadline, 10);
+      if (!t) return;
+      var sec = Math.max(0, t - Math.floor(Date.now()/1000));
+      var span = el.querySelector('.secs');
+      if (span) span.textContent = sec;
+    });
+  }
+  tick();
+  setInterval(tick, 1000);
+
+  // Auto-save the in-progress guess to the server every time it changes
+  // (debounced ~400ms). If the round ends before the player hits Submit —
+  // grace timer, admin "End round now", last player answers — the server
+  // promotes the latest draft to a real answer so half-typed guesses still
+  // count.
+  var draftTimer = null;
+  var lastDraftSong = "", lastDraftArtist = "";
+  function sendDraftNow() {
+    var form = document.querySelector('form[action="/answer"]');
+    if (!form) return;
+    var s = (form.querySelector('[name=song]') || {}).value || "";
+    var a = (form.querySelector('[name=artist]') || {}).value || "";
+    if (s === lastDraftSong && a === lastDraftArtist) return;
+    lastDraftSong = s; lastDraftArtist = a;
+    var fd = new FormData();
+    fd.append('song', s);
+    fd.append('artist', a);
+    try {
+      fetch('/draft', { method: 'POST', body: fd, credentials: 'same-origin', keepalive: true })
+        .catch(function(){});
+    } catch (_) { /* ignore */ }
+  }
+  function scheduleDraft() {
+    if (draftTimer) clearTimeout(draftTimer);
+    draftTimer = setTimeout(function(){ draftTimer = null; sendDraftNow(); }, 400);
+  }
+  document.addEventListener('input', function(e){
+    if (e.target && (e.target.name === 'song' || e.target.name === 'artist')) {
+      scheduleDraft();
+    }
+  });
+  // Flush whatever's pending on tab-hide / unload — covers the player
+  // switching apps mid-typing right before the round ends.
+  window.addEventListener('beforeunload', sendDraftNow);
+  document.addEventListener('visibilitychange', function(){
+    if (document.visibilityState === 'hidden') sendDraftNow();
+  });
+
+  var es = new EventSource("/events");
+  es.onmessage = function(e){
+    try {
+      var v = JSON.parse(e.data);
+      if (last === null) { last = v; return; }
+      // Full reload only when the round flips to a new state — avoids wiping
+      // a half-typed answer whenever someone else submits.
+      if (v.round_number !== last.round_number ||
+          v.round_prep   !== last.round_prep   ||
+          v.round_active !== last.round_active ||
+          v.round_ended  !== last.round_ended) {
+        location.reload();
+        return;
+      }
+      // In-place updates for things that shouldn't trigger a reload — avoids
+      // wiping in-progress typing whenever another player submits.
+      if (v.grace_until !== last.grace_until) {
+        setDeadline('grace', v.grace_until);
+      }
+      if (v.auto_advance_at !== last.auto_advance_at) {
+        setDeadline('advance', v.auto_advance_at);
+      }
+      if (v.answer_count !== last.answer_count) {
+        document.querySelectorAll('.count .answered').forEach(function(e){ e.textContent = v.answer_count; });
+      }
+      if (v.player_count !== last.player_count) {
+        document.querySelectorAll('.count .players').forEach(function(e){ e.textContent = v.player_count; });
+      }
+      renderLiveAnswers(v.live_answers);
+      last = v;
+    } catch (err) { /* ignore */ }
+  };
+  es.onerror = function(){ setTimeout(function(){ location.reload(); }, 5000); };
+})();
+</script>
+</body>
+</html>
