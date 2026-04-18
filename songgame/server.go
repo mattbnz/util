@@ -45,6 +45,13 @@ type Server struct {
 	cacheMu    sync.RWMutex
 	cache      playbackCache
 	wakePoller chan struct{}
+
+	// Devices list cache — refreshed lazily, since the device list is fairly
+	// static once the host has things set up. See devicesCacheTTL.
+	devicesMu      sync.Mutex
+	devicesCache   []SpotifyDevice
+	devicesErr     error
+	devicesPolled  time.Time
 }
 
 type playbackCache struct {
@@ -52,6 +59,11 @@ type playbackCache struct {
 	err      error
 	polledAt time.Time
 }
+
+// How long a Devices() result stays fresh before the next /admin/spotify-status
+// call triggers a re-fetch. The Resync action and explicit device refresh
+// button bypass this cache.
+const devicesCacheTTL = 5 * time.Minute
 
 func NewServer(cfg ServerConfig) *Server {
 	funcs := template.FuncMap{
@@ -137,6 +149,24 @@ func (s *Server) SetServerChangeCallback(fn func()) {
 	s.mu.Unlock()
 }
 
+// devicesCached returns the cached device list, fetching from Spotify only
+// when the cache is empty/stale or force=true. Caller is not blocked by other
+// readers — only by an in-flight fetch on the same call. Returns the polled-at
+// timestamp so callers can surface freshness in the UI.
+func (s *Server) devicesCached(force bool) ([]SpotifyDevice, time.Time, error) {
+	s.devicesMu.Lock()
+	defer s.devicesMu.Unlock()
+	fresh := !s.devicesPolled.IsZero() && time.Since(s.devicesPolled) < devicesCacheTTL && s.devicesErr == nil
+	if !force && fresh {
+		return s.devicesCache, s.devicesPolled, s.devicesErr
+	}
+	devs, err := s.spotify.Devices()
+	s.devicesCache = devs
+	s.devicesErr = err
+	s.devicesPolled = time.Now()
+	return s.devicesCache, s.devicesPolled, s.devicesErr
+}
+
 func (s *Server) onAutoAdvance() {
 	if err := s.advanceToNextRound(); err != nil {
 		log.Printf("auto-advance: %v", err)
@@ -171,6 +201,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleSpotifyStatus(w, r)
 	case "/admin/select-device":
 		s.handleSelectDevice(w, r)
+	case "/admin/refresh-devices":
+		s.handleRefreshDevices(w, r)
 	case "/admin/resync":
 		s.handleResync(w, r)
 	case "/admin/end-game":
@@ -536,9 +568,10 @@ func (s *Server) handleSpotifyStatus(w http.ResponseWriter, r *http.Request) {
 		RoundTrackURI    string      `json:"round_track_uri"`
 		RoundTrackName   string      `json:"round_track_name"`
 		Mismatch         bool        `json:"mismatch"`
-		Devices          []deviceOut `json:"devices,omitempty"`
-		DevicesError     string      `json:"devices_error,omitempty"`
-		SelectedDeviceID string      `json:"selected_device_id,omitempty"`
+		Devices           []deviceOut `json:"devices,omitempty"`
+		DevicesError      string      `json:"devices_error,omitempty"`
+		DevicesAgeSeconds *int        `json:"devices_age_seconds"`
+		SelectedDeviceID  string      `json:"selected_device_id,omitempty"`
 	}
 	cp, at, err := s.LastPlaybackStatus()
 	out := resp{SelectedDeviceID: s.SelectedDeviceID()}
@@ -564,7 +597,7 @@ func (s *Server) handleSpotifyStatus(w http.ResponseWriter, r *http.Request) {
 		out.Error = err.Error()
 	}
 	if s.spotify.Authorized() {
-		devs, derr := s.spotify.Devices()
+		devs, devsAt, derr := s.devicesCached(false)
 		if derr != nil {
 			out.DevicesError = derr.Error()
 		} else {
@@ -575,6 +608,10 @@ func (s *Server) handleSpotifyStatus(w http.ResponseWriter, r *http.Request) {
 					Selected: d.ID != "" && d.ID == out.SelectedDeviceID,
 				})
 			}
+		}
+		if !devsAt.IsZero() {
+			age := int(time.Since(devsAt).Seconds())
+			out.DevicesAgeSeconds = &age
 		}
 	}
 	s.game.mu.Lock()
@@ -588,6 +625,21 @@ func (s *Server) handleSpotifyStatus(w http.ResponseWriter, r *http.Request) {
 		out.Mismatch = true
 	}
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+// handleRefreshDevices forces a re-fetch of the Spotify device list, bypassing
+// the TTL cache. Useful when the host just opened Spotify on a new device and
+// doesn't want to wait for the next refresh interval.
+func (s *Server) handleRefreshDevices(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) || r.Method != http.MethodPost {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if _, _, err := s.devicesCached(true); err != nil {
+		s.adminError(w, r, "Couldn't list devices: "+err.Error())
+		return
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
 // handleSelectDevice updates the targeted Spotify Connect device. Empty
@@ -641,6 +693,11 @@ func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
 		log.Printf("resync: updated round track to %q by %v", cp.Item.Name, cp.Item.ArtistNames())
 	} else {
 		log.Printf("resync: no change; round track already matches Spotify")
+	}
+	// Resync is also the natural moment to refresh the device list — the host
+	// is already telling us "things might have changed, look again".
+	if _, _, err := s.devicesCached(true); err != nil {
+		log.Printf("resync: device refresh failed: %v", err)
 	}
 	s.PokePlaybackPoller()
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)

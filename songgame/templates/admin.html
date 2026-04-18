@@ -90,11 +90,17 @@
       <p class="muted" style="font-size:0.85rem; margin:0;">Pick the device the game should target. Skip and currently-playing are scoped to it; reports from other devices are ignored. Leave unselected to follow whichever device is active.</p>
       <form id="deviceForm" method="post" action="/admin/select-device" style="margin-top:0.5rem;">
         <div id="deviceList"><p class="muted">loading devices…</p></div>
-        <div style="margin-top:0.5rem; display:flex; gap:0.5rem; align-items:center;">
+        <div style="margin-top:0.5rem; display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
           <button type="submit" class="secondary">Use selected device</button>
           <button type="submit" class="secondary" name="device_id" value="" title="Stop targeting a specific device">Clear selection</button>
         </div>
       </form>
+      <div style="margin-top:0.5rem; display:flex; gap:0.5rem; align-items:center;">
+        <form method="post" action="/admin/refresh-devices" style="display:inline;">
+          <button type="submit" class="secondary" title="Re-fetch the device list from Spotify now">Refresh devices</button>
+        </form>
+        <span id="devicesAge" class="muted" style="font-size:0.8rem;"></span>
+      </div>
     </div>
 
     <div class="card">
@@ -309,16 +315,26 @@
   // Track which radio the user has manually selected so a re-render doesn't
   // overwrite their pending choice between polls.
   var pendingDeviceID = null;
+  function fmtAge(s){
+    if (s == null || s < 0) return '';
+    if (s < 60) return s + 's ago';
+    var m = Math.floor(s/60); var rem = s%60;
+    return m + 'm' + (rem ? ' ' + rem + 's' : '') + ' ago';
+  }
   function renderDevices(r){
     var box = document.getElementById('deviceList');
+    var age = document.getElementById('devicesAge');
     if (!box) return;
+    if (age) {
+      age.textContent = (r.devices_age_seconds != null) ? 'device list refreshed ' + fmtAge(r.devices_age_seconds) : '';
+    }
     if (r.devices_error) {
       box.innerHTML = '<p class="err" style="margin:0; padding:0.3rem 0.6rem; border-radius:4px;">Couldn\'t list devices: ' + escapeHTML(r.devices_error) + '</p>';
       return;
     }
     var devs = r.devices || [];
     if (devs.length === 0) {
-      box.innerHTML = '<p class="muted" style="margin:0;">No devices visible. Open Spotify on a device and start playing — it should appear here.</p>';
+      box.innerHTML = '<p class="muted" style="margin:0;">No devices visible. Open Spotify on a device, then click <strong>Refresh devices</strong>.</p>';
       return;
     }
     var sel = pendingDeviceID;
