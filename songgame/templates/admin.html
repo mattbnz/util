@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Song game — admin</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 60rem; margin: 1.5rem auto; padding: 0 1rem; }
+  h1 { margin: 0 0 0.25rem 0; }
+  h3 { margin-bottom: 0.5rem; }
+  .card { border: 1px solid #ddd; border-radius: 6px; padding: 1rem; margin-bottom: 1rem; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 40rem) { .grid { grid-template-columns: 1fr; } }
+  button { padding: 0.6rem 1rem; font-size: 1rem; background: #1db954; color: white; border: 0; border-radius: 4px; cursor: pointer; }
+  button.secondary { background: #555; }
+  button.danger { background: #c33; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  form { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+  select { padding: 0.5rem; font-size: 1rem; min-width: 16rem; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #eee; font-size: 0.95rem; }
+  th { color: #666; font-size: 0.85rem; }
+  .muted { color: #888; }
+  .err { color: #c33; }
+  .pill { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; background: #eee; font-size: 0.8rem; }
+  .pill.active { background: #d6f5df; color: #0a6e2c; }
+  .pill.ended { background: #fbe3c1; color: #7a4910; }
+  .now { font-size: 1.2rem; font-weight: 600; }
+  .mark-ok { color: #1db954; font-weight: 600; }
+  .mark-no { color: #c33; }
+</style>
+</head>
+<body>
+  <h1>Song game — admin</h1>
+
+  {{if .Err}}<div class="card err">{{.Err}}</div>{{end}}
+
+  {{if not .Authorized}}
+    <div class="card">
+      <h3>Connect Spotify</h3>
+      <p>The server needs permission to control your Spotify playback.</p>
+      <p class="muted">Redirect URI registered with your Spotify app must be:<br><code>{{.RedirectURI}}</code></p>
+      <form method="get" action="/admin/login"><button type="submit">Log in with Spotify</button></form>
+    </div>
+  {{else}}
+    <div class="grid">
+      <div class="card">
+        <h3>Playlist</h3>
+        {{with .View}}
+          {{if .PlaylistID}}
+            <p class="now">{{.PlaylistName}}</p>
+            <p class="muted">{{.TrackCount}} tracks loaded</p>
+          {{else}}
+            <p class="muted">No playlist selected yet.</p>
+          {{end}}
+        {{end}}
+        <form method="post" action="/admin/select-playlist">
+          <select name="playlist_id" onchange="this.form.playlist_name.value = this.options[this.selectedIndex].text" required>
+            <option value="">— choose playlist —</option>
+            {{range .Playlists}}<option value="{{.ID}}">{{.Name}} ({{.Tracks.Total}} tracks)</option>{{end}}
+          </select>
+          <input type="hidden" name="playlist_name" value="">
+          <button type="submit" class="secondary">Load</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h3>Playback device</h3>
+        {{with .View}}
+          {{if .DeviceID}}
+            <p class="now">{{.DeviceName}}</p>
+          {{else}}
+            <p class="muted">No device selected. Open Spotify on the device you want to play on, then refresh.</p>
+          {{end}}
+        {{end}}
+        <form method="post" action="/admin/select-device">
+          <select name="device_id" onchange="this.form.device_name.value = this.options[this.selectedIndex].text" required>
+            <option value="">— choose device —</option>
+            {{range .Devices}}<option value="{{.ID}}">{{.Name}} ({{.Type}}{{if .IsActive}} · active{{end}})</option>{{end}}
+          </select>
+          <input type="hidden" name="device_name" value="">
+          <button type="submit" class="secondary">Use</button>
+        </form>
+      </div>
+    </div>
+
+    {{with .View}}
+    <div class="card">
+      <h3>
+        Round {{if .RoundNumber}}{{.RoundNumber}}{{else}}—{{end}}
+        {{if .RoundActive}}<span class="pill active">playing</span>{{else if .RoundEnded}}<span class="pill ended">ended</span>{{end}}
+      </h3>
+      {{if .CurrentSong}}
+        <p class="now">{{.CurrentSong}} <span class="muted">— {{.CurrentArtists}}</span></p>
+      {{else}}
+        <p class="muted">No round in progress.</p>
+      {{end}}
+      <p class="muted">{{.AnswerCount}} of {{.PlayerCount}} players answered</p>
+      <form method="post" action="/admin/start-round" style="display:inline">
+        <button type="submit" {{if or (not .PlaylistID) (not .DeviceID)}}disabled{{end}}>
+          {{if .RoundActive}}Skip to next round{{else}}Start next round{{end}}
+        </button>
+      </form>
+      {{if .RoundActive}}
+      <form method="post" action="/admin/end-round" style="display:inline">
+        <button type="submit" class="danger">End round now</button>
+      </form>
+      {{end}}
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Answers this round</h3>
+        {{if .Answers}}
+        <table>
+          <tr><th>Player</th><th>Song</th><th>Artist</th></tr>
+          {{range .Answers}}
+          <tr>
+            <td>{{.PlayerName}}</td>
+            <td>{{.SongGuess}} {{if .SongCorrect}}<span class="mark-ok">✓</span>{{else}}<span class="mark-no">✗</span>{{end}}</td>
+            <td>{{.ArtistGuess}} {{if .ArtistCorrect}}<span class="mark-ok">✓</span>{{else}}<span class="mark-no">✗</span>{{end}}</td>
+          </tr>
+          {{end}}
+        </table>
+        {{else}}
+          <p class="muted">No answers yet.</p>
+        {{end}}
+      </div>
+
+      <div class="card">
+        <h3>Scoreboard</h3>
+        <table>
+          <tr><th>#</th><th>Player</th><th>Score</th></tr>
+          {{range $i, $p := .Scoreboard}}
+          <tr><td>{{inc $i}}</td><td>{{$p.Name}}</td><td>{{$p.Score}}</td></tr>
+          {{end}}
+        </table>
+      </div>
+    </div>
+    {{end}}
+  {{end}}
+
+<script>
+(function(){
+  var es = new EventSource("/admin/events");
+  es.onmessage = function(){ location.reload(); };
+  es.onerror = function(){ setTimeout(function(){ location.reload(); }, 3000); };
+})();
+</script>
+</body>
+</html>

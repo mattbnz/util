@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Guess that song</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 1.5rem auto; padding: 0 1rem; }
+  h1 { margin: 0 0 0.25rem 0; }
+  .you { color: #666; margin-bottom: 1rem; }
+  .card { border: 1px solid #ddd; border-radius: 6px; padding: 1rem; margin-bottom: 1rem; }
+  .status { font-size: 1.1rem; font-weight: 600; }
+  .waiting { color: #888; }
+  .active { color: #1db954; }
+  .reveal { color: #b26a00; }
+  form { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.75rem; }
+  input[type=text] { padding: 0.6rem; font-size: 1rem; border: 1px solid #999; border-radius: 4px; }
+  button { padding: 0.6rem 1rem; font-size: 1rem; background: #1db954; color: white; border: 0; border-radius: 4px; cursor: pointer; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #eee; }
+  th { font-size: 0.85rem; color: #666; }
+  .me { font-weight: 600; }
+  .mark-ok { color: #1db954; font-weight: 600; }
+  .mark-no { color: #c33; }
+  .count { color: #666; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+  <h1>Guess that song</h1>
+  {{if .You}}<div class="you">Playing as <strong>{{.You.Name}}</strong></div>{{end}}
+
+  <div class="card" id="round">
+    {{if .RoundActive}}
+      <div class="status active">Round {{.RoundNumber}} — a song is playing!</div>
+      {{if .HasAnswered}}
+        <p>You answered. Waiting for others…</p>
+        <p class="count">{{.AnswerCount}} of {{.PlayerCount}} players answered</p>
+      {{else}}
+        <form method="post" action="/answer">
+          <label>Song title <input type="text" name="song" autocomplete="off" autofocus required></label>
+          <label>Artist <input type="text" name="artist" autocomplete="off" required></label>
+          <button type="submit">Submit</button>
+        </form>
+        <p class="count">{{.AnswerCount}} of {{.PlayerCount}} players answered so far</p>
+      {{end}}
+    {{else if .RoundEnded}}
+      <div class="status reveal">Round {{.RoundNumber}} ended</div>
+      <p>The song was <strong>{{.RevealSong}}</strong> by <strong>{{.RevealArtists}}</strong>.</p>
+      {{if .HasAnswered}}
+        <p>Your guess: <em>{{.YourSongGuess}}</em> by <em>{{.YourArtistGuess}}</em></p>
+        <p>Song: {{if .YourSongOK}}<span class="mark-ok">correct</span>{{else}}<span class="mark-no">nope</span>{{end}}
+           &nbsp;·&nbsp; Artist: {{if .YourArtistOK}}<span class="mark-ok">correct</span>{{else}}<span class="mark-no">nope</span>{{end}}</p>
+      {{else}}
+        <p>You didn't answer in time.</p>
+      {{end}}
+      <p class="waiting">Waiting for the next round…</p>
+    {{else}}
+      <div class="status waiting">Waiting for the host to start a round…</div>
+    {{end}}
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">Scoreboard</h3>
+    <table>
+      <tr><th>#</th><th>Player</th><th>Score</th></tr>
+      {{range $i, $p := .Scoreboard}}
+      <tr class="{{if and $.You (eq $p.ID $.You.ID)}}me{{end}}">
+        <td>{{inc $i}}</td><td>{{$p.Name}}</td><td>{{$p.Score}}</td>
+      </tr>
+      {{end}}
+    </table>
+  </div>
+
+<script>
+(function(){
+  var last = null;
+  var es = new EventSource("/events");
+  es.onmessage = function(e){
+    try {
+      var v = JSON.parse(e.data);
+      if (last === null) { last = v; return; }
+      // Only reload when round state changes — avoids wiping a half-typed answer
+      // whenever someone else submits.
+      if (v.round_number !== last.round_number ||
+          v.round_active !== last.round_active ||
+          v.round_ended  !== last.round_ended) {
+        location.reload();
+      }
+      last = v;
+    } catch (err) { /* ignore */ }
+  };
+  es.onerror = function(){ setTimeout(function(){ location.reload(); }, 5000); };
+})();
+</script>
+</body>
+</html>
