@@ -65,6 +65,7 @@ func main() {
 		}
 		srv.Game().SetChangeCallback(store.MarkDirty)
 		srv.Spotify().SetTokenCallback(store.MarkDirty)
+		srv.SetServerChangeCallback(store.MarkDirty)
 		// Force a save shortly after startup so freshly-generated values
 		// (like a new admin token when the state file was missing) make it
 		// to disk even if nothing else changes.

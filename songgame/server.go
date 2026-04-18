@@ -26,36 +26,44 @@ type ServerConfig struct {
 	BaseURL      string // e.g. http://127.0.0.1:8080 — used to print the shareable admin URL
 }
 
-// Volume to drop to during the results period. 30% is a "background" level
-// on most devices — still audible, but quiet enough to talk over.
-const duckedPercent = 30
-
 type Server struct {
 	cfg     ServerConfig
 	spotify *SpotifyClient
 	game    *Game
 	tpl     *template.Template
 
-	mu         sync.Mutex
-	oauthState string
-	adminToken string
-
-	volMu         sync.Mutex
-	preDuckVolume int // 0 = not ducked; otherwise the volume we should restore to
+	mu                sync.Mutex
+	oauthState        string
+	adminToken        string
+	selectedDeviceID  string
+	onSelectionChange func()
 
 	// Shared playback-state cache. A single background poller fills this in
 	// adaptively; both /admin/spotify-status and the auto-resync logic read
-	// from here, so we don't hammer /me/player with concurrent callers.
+	// from here, so we don't hammer /me/player/currently-playing with
+	// concurrent callers.
 	cacheMu    sync.RWMutex
 	cache      playbackCache
 	wakePoller chan struct{}
+
+	// Devices list cache — refreshed lazily, since the device list is fairly
+	// static once the host has things set up. See devicesCacheTTL.
+	devicesMu      sync.Mutex
+	devicesCache   []SpotifyDevice
+	devicesErr     error
+	devicesPolled  time.Time
 }
 
 type playbackCache struct {
-	status   *PlaybackStatus
+	status   *CurrentlyPlaying
 	err      error
 	polledAt time.Time
 }
+
+// How long a Devices() result stays fresh before the next /admin/spotify-status
+// call triggers a re-fetch. The Resync action and explicit device refresh
+// button bypass this cache.
+const devicesCacheTTL = 5 * time.Minute
 
 func NewServer(cfg ServerConfig) *Server {
 	funcs := template.FuncMap{
@@ -70,7 +78,7 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	s.adminToken = randomHex(16)
 	s.wakePoller = make(chan struct{}, 1)
-	s.game.SetCallbacks(s.onRoundEnd, s.onAutoAdvance)
+	s.game.SetCallbacks(nil, s.onAutoAdvance)
 	return s
 }
 
@@ -104,6 +112,7 @@ func (s *Server) Snapshot() StateSnapshot {
 	snap.AdminToken = s.adminToken
 	snap.SpotifyClientID = s.cfg.ClientID
 	snap.SpotifyClientSecret = s.cfg.ClientSecret
+	snap.SpotifyDeviceID = s.selectedDeviceID
 	s.mu.Unlock()
 	snap.SpotifyRefreshToken = s.spotify.RefreshToken()
 	return snap
@@ -114,54 +123,54 @@ func (s *Server) Snapshot() StateSnapshot {
 // generated in NewServer are replaced.
 func (s *Server) RestoreState(snap StateSnapshot) {
 	s.game.RestoreState(snap)
+	s.mu.Lock()
 	if snap.AdminToken != "" {
-		s.mu.Lock()
 		s.adminToken = snap.AdminToken
-		s.mu.Unlock()
 	}
+	s.selectedDeviceID = snap.SpotifyDeviceID
+	s.mu.Unlock()
 	s.spotify.LoadRefreshToken(snap.SpotifyRefreshToken)
 }
 
-func (s *Server) onRoundEnd() {
-	s.duckVolume()
+// SelectedDeviceID returns the Spotify Connect device the host has chosen to
+// target, or "" if no preference (use whatever is currently active).
+func (s *Server) SelectedDeviceID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.selectedDeviceID
+}
+
+// SetServerChangeCallback registers a hook that fires when server-level state
+// (currently just the selected Spotify device) changes, so the persistent
+// store can mark itself dirty.
+func (s *Server) SetServerChangeCallback(fn func()) {
+	s.mu.Lock()
+	s.onSelectionChange = fn
+	s.mu.Unlock()
+}
+
+// devicesCached returns the cached device list, fetching from Spotify only
+// when the cache is empty/stale or force=true. Caller is not blocked by other
+// readers — only by an in-flight fetch on the same call. Returns the polled-at
+// timestamp so callers can surface freshness in the UI.
+func (s *Server) devicesCached(force bool) ([]SpotifyDevice, time.Time, error) {
+	s.devicesMu.Lock()
+	defer s.devicesMu.Unlock()
+	fresh := !s.devicesPolled.IsZero() && time.Since(s.devicesPolled) < devicesCacheTTL && s.devicesErr == nil
+	if !force && fresh {
+		return s.devicesCache, s.devicesPolled, s.devicesErr
+	}
+	devs, err := s.spotify.Devices()
+	s.devicesCache = devs
+	s.devicesErr = err
+	s.devicesPolled = time.Now()
+	return s.devicesCache, s.devicesPolled, s.devicesErr
 }
 
 func (s *Server) onAutoAdvance() {
 	if err := s.advanceToNextRound(); err != nil {
 		log.Printf("auto-advance: %v", err)
 	}
-}
-
-func (s *Server) duckVolume() {
-	s.volMu.Lock()
-	defer s.volMu.Unlock()
-	if s.preDuckVolume > 0 {
-		return // already ducked
-	}
-	vol, err := s.spotify.DeviceVolume()
-	if err != nil || vol < 0 {
-		return
-	}
-	if vol <= duckedPercent {
-		return // already quiet enough
-	}
-	if err := s.spotify.SetVolume(duckedPercent); err != nil {
-		log.Printf("duck volume: %v", err)
-		return
-	}
-	s.preDuckVolume = vol
-}
-
-func (s *Server) unduckVolume() {
-	s.volMu.Lock()
-	defer s.volMu.Unlock()
-	if s.preDuckVolume == 0 {
-		return
-	}
-	if err := s.spotify.SetVolume(s.preDuckVolume); err != nil {
-		log.Printf("restore volume: %v", err)
-	}
-	s.preDuckVolume = 0
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -172,6 +181,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleJoin(w, r)
 	case "/answer":
 		s.handleAnswer(w, r)
+	case "/draft":
+		s.handleDraft(w, r)
 	case "/events":
 		s.handlePlayerEvents(w, r)
 	case "/admin":
@@ -190,6 +201,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleConfig(w, r)
 	case "/admin/spotify-status":
 		s.handleSpotifyStatus(w, r)
+	case "/admin/select-device":
+		s.handleSelectDevice(w, r)
+	case "/admin/refresh-devices":
+		s.handleRefreshDevices(w, r)
 	case "/admin/resync":
 		s.handleResync(w, r)
 	case "/admin/end-game":
@@ -249,6 +264,28 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	s.game.AddOrUpdatePlayer(id, name)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// handleDraft records the player's in-progress (untyped or partially-typed)
+// guess. Players' clients post this periodically while typing so a sudden
+// round-end (admin "End round now", last player submits, grace timeout)
+// doesn't lose their work — the latest draft is promoted to a real answer
+// when the round ends. Returns 204 unconditionally; called from background
+// fetch() so we don't redirect.
+func (s *Server) handleDraft(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := s.playerID(r)
+	if id == "" || s.game.GetPlayer(id) == nil {
+		http.Error(w, "not joined", http.StatusUnauthorized)
+		return
+	}
+	song := strings.TrimSpace(r.FormValue("song"))
+	artist := strings.TrimSpace(r.FormValue("artist"))
+	s.game.UpdateDraft(id, song, artist)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleAnswer(w http.ResponseWriter, r *http.Request) {
@@ -423,19 +460,19 @@ func (s *Server) PokePlaybackPoller() {
 	}
 }
 
-// LastPlaybackStatus returns the most recently cached Spotify playback state
-// along with the time of the poll and any error recorded.
-func (s *Server) LastPlaybackStatus() (*PlaybackStatus, time.Time, error) {
+// LastPlaybackStatus returns the most recently cached currently-playing
+// response along with the time of the poll and any error recorded.
+func (s *Server) LastPlaybackStatus() (*CurrentlyPlaying, time.Time, error) {
 	s.cacheMu.RLock()
 	defer s.cacheMu.RUnlock()
 	return s.cache.status, s.cache.polledAt, s.cache.err
 }
 
-// RunPlaybackPoller is the single source of /me/player traffic. It caches the
-// last status for the admin UI to read, drives the prep→active transition
-// when a round is being set up, and fires immediate resyncs when an active
-// round drifts from what Spotify is playing. Cadence adapts to the current
-// phase (see pollPrep / pollInSync / pollIdle constants).
+// RunPlaybackPoller is the single source of /me/player/currently-playing
+// traffic. It caches the last status for the admin UI to read, drives the
+// prep→active transition when a round is being set up, and fires immediate
+// resyncs when an active round drifts from what Spotify is playing. Cadence
+// adapts to the current phase (see pollPrep / pollInSync / pollIdle constants).
 //
 // Blocks until stop is closed.
 func (s *Server) RunPlaybackPoller(stop <-chan struct{}) {
@@ -456,19 +493,25 @@ func (s *Server) RunPlaybackPoller(stop <-chan struct{}) {
 			interval = pollIdle
 			continue
 		}
-		st, err := s.spotify.PlaybackStatus()
+		cp, err := s.spotify.CurrentlyPlaying()
 		s.cacheMu.Lock()
-		s.cache = playbackCache{status: st, err: err, polledAt: time.Now()}
+		s.cache = playbackCache{status: cp, err: err, polledAt: time.Now()}
 		s.cacheMu.Unlock()
 		if err != nil {
 			// transient network / API hiccup — back off briefly and retry
 			interval = pollPrep
 			continue
 		}
+		// If a device is selected, ignore reports that come from a different
+		// device. Multi-device setups (phone driving a stereo via Connect)
+		// otherwise produce confusing prep timeouts and false resyncs.
+		if devID := s.SelectedDeviceID(); devID != "" && cp != nil && cp.Device != nil && cp.Device.ID != "" && cp.Device.ID != devID {
+			cp = nil
+		}
 		switch phase {
 		case PhasePrep:
 			interval = pollPrep
-			if st == nil || st.Raw204 || st.TrackURI == "" {
+			if cp == nil || cp.Item == nil || cp.Item.URI == "" {
 				// nothing playing yet — if we've been trying too long, give up
 				if s.prepTimedOut() {
 					s.game.CancelPrepRound()
@@ -478,7 +521,7 @@ func (s *Server) RunPlaybackPoller(stop <-chan struct{}) {
 				continue
 			}
 			prev := s.game.PrepPrevURI()
-			if prev != "" && st.TrackURI == prev {
+			if prev != "" && cp.Item.URI == prev {
 				// skip hasn't taken effect yet; keep waiting
 				if s.prepTimedOut() {
 					s.game.CancelPrepRound()
@@ -488,22 +531,20 @@ func (s *Server) RunPlaybackPoller(stop <-chan struct{}) {
 				continue
 			}
 			// Got a fresh track — activate.
-			if track, ok := st.AsTrack(); ok {
-				s.game.ActivateRound(track)
-				log.Printf("prep→active: %q by %v", track.Name, track.ArtistNames())
-				interval = pollInSync
-			}
+			track := *cp.Item
+			s.game.ActivateRound(track)
+			log.Printf("prep→active: %q by %v", track.Name, track.ArtistNames())
+			interval = pollInSync
 		case PhaseActive:
 			interval = pollInSync
 			expected := s.game.CurrentTrackURI()
-			if st == nil || st.Raw204 || st.TrackURI == "" || st.TrackURI == expected {
+			if cp == nil || cp.Item == nil || cp.Item.URI == "" || cp.Item.URI == expected {
 				continue
 			}
 			// Immediate resync — user asked for no delay.
-			if track, ok := st.AsTrack(); ok {
-				if s.game.UpdateRoundTrack(track) {
-					log.Printf("auto-resync: round track updated to %q by %v", track.Name, track.ArtistNames())
-				}
+			track := *cp.Item
+			if s.game.UpdateRoundTrack(track) {
+				log.Printf("auto-resync: round track updated to %q by %v", track.Name, track.ArtistNames())
 			}
 		}
 	}
@@ -526,24 +567,76 @@ func (s *Server) handleSpotifyStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	type resp struct {
-		Status         *PlaybackStatus `json:"status"`
-		Error          string          `json:"error,omitempty"`
-		PolledAt       int64           `json:"polled_at,omitempty"`
-		AgeSeconds     int             `json:"age_seconds,omitempty"`
-		RoundActive    bool            `json:"round_active"`
-		RoundTrackURI  string          `json:"round_track_uri"`
-		RoundTrackName string          `json:"round_track_name"`
-		Mismatch       bool            `json:"mismatch"`
+	type statusOut struct {
+		IsPlaying    bool     `json:"is_playing"`
+		DeviceID     string   `json:"device_id,omitempty"`
+		DeviceName   string   `json:"device_name,omitempty"`
+		DeviceType   string   `json:"device_type,omitempty"`
+		TrackURI     string   `json:"track_uri,omitempty"`
+		TrackName    string   `json:"track_name,omitempty"`
+		TrackArtists []string `json:"track_artists,omitempty"`
 	}
-	st, at, err := s.LastPlaybackStatus()
-	out := resp{Status: st}
+	type deviceOut struct {
+		ID       string `json:"id"`
+		Name     string `json:"name"`
+		Type     string `json:"type"`
+		IsActive bool   `json:"is_active"`
+		Selected bool   `json:"selected"`
+	}
+	type resp struct {
+		Status           *statusOut  `json:"status"`
+		Error            string      `json:"error,omitempty"`
+		PolledAt         int64       `json:"polled_at,omitempty"`
+		AgeSeconds       int         `json:"age_seconds,omitempty"`
+		RoundActive      bool        `json:"round_active"`
+		RoundTrackURI    string      `json:"round_track_uri"`
+		RoundTrackName   string      `json:"round_track_name"`
+		Mismatch         bool        `json:"mismatch"`
+		Devices           []deviceOut `json:"devices,omitempty"`
+		DevicesError      string      `json:"devices_error,omitempty"`
+		DevicesAgeSeconds *int        `json:"devices_age_seconds"`
+		SelectedDeviceID  string      `json:"selected_device_id,omitempty"`
+	}
+	cp, at, err := s.LastPlaybackStatus()
+	out := resp{SelectedDeviceID: s.SelectedDeviceID()}
+	if cp != nil {
+		st := &statusOut{IsPlaying: cp.IsPlaying}
+		if cp.Device != nil {
+			st.DeviceID = cp.Device.ID
+			st.DeviceName = cp.Device.Name
+			st.DeviceType = cp.Device.Type
+		}
+		if cp.Item != nil {
+			st.TrackURI = cp.Item.URI
+			st.TrackName = cp.Item.Name
+			st.TrackArtists = cp.Item.ArtistNames()
+		}
+		out.Status = st
+	}
 	if !at.IsZero() {
 		out.PolledAt = at.Unix()
 		out.AgeSeconds = int(time.Since(at).Seconds())
 	}
 	if err != nil {
 		out.Error = err.Error()
+	}
+	if s.spotify.Authorized() {
+		devs, devsAt, derr := s.devicesCached(false)
+		if derr != nil {
+			out.DevicesError = derr.Error()
+		} else {
+			out.Devices = make([]deviceOut, 0, len(devs))
+			for _, d := range devs {
+				out.Devices = append(out.Devices, deviceOut{
+					ID: d.ID, Name: d.Name, Type: d.Type, IsActive: d.IsActive,
+					Selected: d.ID != "" && d.ID == out.SelectedDeviceID,
+				})
+			}
+		}
+		if !devsAt.IsZero() {
+			age := int(time.Since(devsAt).Seconds())
+			out.DevicesAgeSeconds = &age
+		}
 	}
 	s.game.mu.Lock()
 	if s.game.Round != nil && !s.game.Round.Ended {
@@ -556,6 +649,45 @@ func (s *Server) handleSpotifyStatus(w http.ResponseWriter, r *http.Request) {
 		out.Mismatch = true
 	}
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+// handleRefreshDevices forces a re-fetch of the Spotify device list, bypassing
+// the TTL cache. Useful when the host just opened Spotify on a new device and
+// doesn't want to wait for the next refresh interval.
+func (s *Server) handleRefreshDevices(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) || r.Method != http.MethodPost {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if _, _, err := s.devicesCached(true); err != nil {
+		s.adminError(w, r, "Couldn't list devices: "+err.Error())
+		return
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+// handleSelectDevice updates the targeted Spotify Connect device. Empty
+// device_id clears the preference (use whatever is currently active).
+func (s *Server) handleSelectDevice(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) || r.Method != http.MethodPost {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	id := strings.TrimSpace(r.FormValue("device_id"))
+	s.mu.Lock()
+	changed := s.selectedDeviceID != id
+	s.selectedDeviceID = id
+	cb := s.onSelectionChange
+	s.mu.Unlock()
+	if changed {
+		log.Printf("admin: selected Spotify device %q", id)
+		if cb != nil {
+			cb()
+		}
+		// re-poke the poller in case the round was waiting on the wrong device
+		s.PokePlaybackPoller()
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
 func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
@@ -572,6 +704,10 @@ func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
 		s.adminError(w, r, "Resync failed: Spotify isn't reporting a track. Start playback first.")
 		return
 	}
+	if devID := s.SelectedDeviceID(); devID != "" && cp.Device != nil && cp.Device.ID != "" && cp.Device.ID != devID {
+		s.adminError(w, r, "Resync failed: Spotify is playing on a different device than the one you selected.")
+		return
+	}
 	if !s.game.HasActiveRound() {
 		s.adminError(w, r, "Resync needs an active round. Use Start next round for a fresh one.")
 		return
@@ -581,6 +717,11 @@ func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
 		log.Printf("resync: updated round track to %q by %v", cp.Item.Name, cp.Item.ArtistNames())
 	} else {
 		log.Printf("resync: no change; round track already matches Spotify")
+	}
+	// Resync is also the natural moment to refresh the device list — the host
+	// is already telling us "things might have changed, look again".
+	if _, _, err := s.devicesCached(true); err != nil {
+		log.Printf("resync: device refresh failed: %v", err)
 	}
 	s.PokePlaybackPoller()
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
@@ -628,26 +769,23 @@ func (s *Server) handleEndRound(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	s.game.EndRound() // callbacks handle ducking playback
+	s.game.EndRound()
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
-// advanceToNextRound begins the next round. It un-ducks volume, issues a skip
-// only if a previous round exists (round 1 keeps whatever is playing), starts
-// playback, and opens a prep-phase round. The playback poller then watches
-// /me/player until the track URI differs from the prev round's (or any track
-// appears for round 1) and flips the round to active. Players don't see the
-// round until that transition happens.
+// advanceToNextRound begins the next round. It issues a skip only if a
+// previous round exists (round 1 keeps whatever is playing) and opens a
+// prep-phase round. The playback poller then watches
+// /me/player/currently-playing until the track URI differs from the prev
+// round's (or any track appears for round 1) and flips the round to active.
+// Players don't see the round until that transition happens. For round 1 the
+// host is expected to already have Spotify playing on a device.
 func (s *Server) advanceToNextRound() error {
-	s.unduckVolume()
 	prevURI := s.game.CurrentTrackURI() // non-empty only if a completed round is still around
 	if prevURI != "" {
 		if err := s.spotify.Next(); err != nil {
 			return fmt.Errorf("couldn't skip to the next song: %v — make sure Spotify is open and playing on a device", err)
 		}
-	}
-	if err := s.spotify.Play(); err != nil {
-		return fmt.Errorf("couldn't start playback: %v — open Spotify, start your playlist (shuffle recommended), then try again", err)
 	}
 	s.game.BeginPrepRound(prevURI)
 	s.PokePlaybackPoller()

@@ -339,6 +339,106 @@ func TestPrevRoundCapturedOnEndAndPersistsIntoNextRound(t *testing.T) {
 	}
 }
 
+func TestDraftIsPromotedWhenRoundEndsWithoutSubmit(t *testing.T) {
+	g := NewGame()
+	g.AddOrUpdatePlayer("a", "Alice")
+	g.AddOrUpdatePlayer("b", "Bob")
+	g.StartRound(track("t1", "Imagine", "John Lennon"))
+
+	// Bob has typed something but never hit Submit.
+	if !g.UpdateDraft("b", "Imagin", "John Lennon") {
+		t.Fatalf("UpdateDraft should succeed during active round")
+	}
+	// Alice submits; admin then ends the round before Bob can finish.
+	g.SubmitAnswer("a", "Imagine", "Lennon")
+	g.EndRound()
+
+	v := g.AdminView()
+	var bob *Answer
+	for _, a := range v.Answers {
+		if a.PlayerID == "b" {
+			bob = a
+		}
+	}
+	if bob == nil {
+		t.Fatalf("Bob's draft should have been promoted to an answer")
+	}
+	if bob.SongGuess != "Imagin" || bob.ArtistGuess != "John Lennon" {
+		t.Errorf("promoted draft text wrong: %+v", bob)
+	}
+	if !bob.SongCorrect || !bob.ArtistCorrect {
+		t.Errorf("promoted draft should be graded; got song=%v artist=%v", bob.SongCorrect, bob.ArtistCorrect)
+	}
+	if g.Players["b"].Score != 2 {
+		t.Errorf("Bob should have scored 2 from his promoted draft, got %d", g.Players["b"].Score)
+	}
+}
+
+func TestExplicitAnswerWinsOverDraft(t *testing.T) {
+	g := NewGame()
+	g.AddOrUpdatePlayer("a", "Alice")
+	g.AddOrUpdatePlayer("b", "Bob") // never answers — keeps round open
+	g.StartRound(track("t1", "Imagine", "John Lennon"))
+
+	g.UpdateDraft("a", "wrong", "wrong")
+	g.SubmitAnswer("a", "Imagine", "Lennon")
+	// Late draft after submission is ignored — already submitted.
+	if g.UpdateDraft("a", "later draft", "later") {
+		t.Errorf("UpdateDraft should be a no-op once the player has formally submitted")
+	}
+	g.EndRound()
+
+	v := g.AdminView()
+	var alice *Answer
+	for _, a := range v.Answers {
+		if a.PlayerID == "a" {
+			alice = a
+		}
+	}
+	if alice == nil || alice.SongGuess != "Imagine" {
+		t.Fatalf("Alice's explicit submission should win, got %+v", alice)
+	}
+}
+
+func TestEmptyDraftIsNotPromoted(t *testing.T) {
+	g := NewGame()
+	g.AddOrUpdatePlayer("a", "Alice")
+	g.AddOrUpdatePlayer("b", "Bob")
+	g.StartRound(track("t1", "Imagine", "John Lennon"))
+
+	// Bob's client posts a draft but they cleared the inputs.
+	g.UpdateDraft("b", "", "")
+	g.SubmitAnswer("a", "Imagine", "Lennon")
+	g.EndRound()
+
+	v := g.AdminView()
+	for _, a := range v.Answers {
+		if a.PlayerID == "b" {
+			t.Fatalf("empty draft should not promote to an answer: %+v", a)
+		}
+	}
+}
+
+func TestDraftRefusedOutsideActiveRound(t *testing.T) {
+	g := NewGame()
+	g.AddOrUpdatePlayer("a", "A")
+	if g.UpdateDraft("a", "x", "y") {
+		t.Errorf("UpdateDraft should be false with no round")
+	}
+	g.BeginPrepRound("")
+	if g.UpdateDraft("a", "x", "y") {
+		t.Errorf("UpdateDraft should be false during prep")
+	}
+	g.ActivateRound(track("t1", "Song", "Artist"))
+	if !g.UpdateDraft("a", "x", "y") {
+		t.Errorf("UpdateDraft should succeed during active")
+	}
+	g.EndRound()
+	if g.UpdateDraft("a", "x", "y") {
+		t.Errorf("UpdateDraft should be false after round ended")
+	}
+}
+
 func TestGraceUntilClearsOnRoundEnd(t *testing.T) {
 	g := NewGame()
 	g.AddOrUpdatePlayer("a", "A")

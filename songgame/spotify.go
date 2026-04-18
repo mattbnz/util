@@ -8,13 +8,12 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-const spotifyScopes = "user-read-playback-state user-modify-playback-state user-read-currently-playing"
+const spotifyScopes = "user-read-currently-playing user-modify-playback-state"
 
 type SpotifyClient struct {
 	clientID     string
@@ -262,6 +261,7 @@ type CurrentlyPlaying struct {
 	IsPlaying bool          `json:"is_playing"`
 	Item      *SpotifyTrack `json:"item"`
 	Device    *struct {
+		ID   string `json:"id"`
 		Name string `json:"name"`
 		Type string `json:"type"`
 	} `json:"device"`
@@ -299,157 +299,30 @@ func (s *SpotifyClient) CurrentlyPlaying() (*CurrentlyPlaying, error) {
 	return &cp, nil
 }
 
-// PlaybackStatus is a richer snapshot of /me/player, exposed to the admin UI
-// so the host can debug device/state mismatches.
-type PlaybackStatus struct {
-	DeviceID      string   `json:"device_id"`
-	DeviceName    string   `json:"device_name"`
-	DeviceType    string   `json:"device_type"`
-	VolumePercent int      `json:"volume_percent"`
-	IsActive      bool     `json:"is_active"`
-	IsPlaying     bool     `json:"is_playing"`
-	Shuffle       bool     `json:"shuffle"`
-	RepeatState   string   `json:"repeat_state"`
-	TrackURI      string   `json:"track_uri"`
-	TrackName     string   `json:"track_name"`
-	TrackArtists  []string `json:"track_artists"`
-	ProgressMS    int      `json:"progress_ms"`
-	DurationMS    int      `json:"duration_ms"`
-	Raw204        bool     `json:"raw_204"` // true when Spotify returned "no playback session" (204)
+type SpotifyDevice struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	IsActive bool   `json:"is_active"`
 }
 
-// AsTrack builds a SpotifyTrack from the status, for use with Game.UpdateRoundTrack.
-// Returns (nil, false) if there's no usable track info.
-func (p *PlaybackStatus) AsTrack() (SpotifyTrack, bool) {
-	if p == nil || p.TrackURI == "" {
-		return SpotifyTrack{}, false
+// Devices lists the user's available Spotify Connect devices.
+func (s *SpotifyClient) Devices() ([]SpotifyDevice, error) {
+	var out struct {
+		Devices []SpotifyDevice `json:"devices"`
 	}
-	t := SpotifyTrack{URI: p.TrackURI, Name: p.TrackName}
-	for _, a := range p.TrackArtists {
-		t.Artists = append(t.Artists, struct {
-			Name string `json:"name"`
-		}{Name: a})
-	}
-	return t, true
-}
-
-// PlaybackStatus returns a richer view of the current Spotify player state.
-func (s *SpotifyClient) PlaybackStatus() (*PlaybackStatus, error) {
-	if err := s.refreshIfNeeded(); err != nil {
+	if err := s.do("GET", "/me/player/devices", nil, &out); err != nil {
 		return nil, err
 	}
-	req, _ := http.NewRequest("GET", "https://api.spotify.com/v1/me/player", nil)
-	s.mu.Lock()
-	req.Header.Set("Authorization", "Bearer "+s.accessToken)
-	s.mu.Unlock()
-	start := time.Now()
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		logCall("GET", "/me/player", 0, time.Since(start), err.Error())
-		return nil, err
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	logCall("GET", "/me/player", resp.StatusCode, time.Since(start), string(data))
-	if resp.StatusCode == 204 {
-		return &PlaybackStatus{Raw204: true}, nil
-	}
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("player: %d %s", resp.StatusCode, data)
-	}
-	var raw struct {
-		Device *struct {
-			ID            string `json:"id"`
-			Name          string `json:"name"`
-			Type          string `json:"type"`
-			VolumePercent int    `json:"volume_percent"`
-			IsActive      bool   `json:"is_active"`
-		} `json:"device"`
-		ShuffleState bool   `json:"shuffle_state"`
-		RepeatState  string `json:"repeat_state"`
-		IsPlaying    bool   `json:"is_playing"`
-		ProgressMS   int    `json:"progress_ms"`
-		Item         *struct {
-			URI        string `json:"uri"`
-			Name       string `json:"name"`
-			DurationMS int    `json:"duration_ms"`
-			Artists    []struct {
-				Name string `json:"name"`
-			} `json:"artists"`
-		} `json:"item"`
-	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, err
-	}
-	st := &PlaybackStatus{
-		IsPlaying:   raw.IsPlaying,
-		Shuffle:     raw.ShuffleState,
-		RepeatState: raw.RepeatState,
-		ProgressMS:  raw.ProgressMS,
-	}
-	if raw.Device != nil {
-		st.DeviceID = raw.Device.ID
-		st.DeviceName = raw.Device.Name
-		st.DeviceType = raw.Device.Type
-		st.VolumePercent = raw.Device.VolumePercent
-		st.IsActive = raw.Device.IsActive
-	}
-	if raw.Item != nil {
-		st.TrackURI = raw.Item.URI
-		st.TrackName = raw.Item.Name
-		st.DurationMS = raw.Item.DurationMS
-		for _, a := range raw.Item.Artists {
-			st.TrackArtists = append(st.TrackArtists, a.Name)
-		}
-	}
-	return st, nil
+	return out.Devices, nil
 }
 
 // Next skips to the next track on whichever device is currently active.
+// We deliberately don't pass device_id: some Spotify Connect endpoints (AV
+// receivers, smart speakers) react badly to device-targeted skips — at best
+// returning 403 "Restriction violated", at worst halting playback entirely.
+// The selected device's job is to filter currently-playing reports, not to
+// route control commands.
 func (s *SpotifyClient) Next() error {
 	return s.do("POST", "/me/player/next", nil, nil)
-}
-
-// Play resumes playback on whichever device is currently active.
-func (s *SpotifyClient) Play() error {
-	err := s.do("PUT", "/me/player/play", nil, nil)
-	// 403 "Restriction violated" can mean already playing — benign
-	if err != nil && strings.Contains(err.Error(), "403") {
-		return nil
-	}
-	return err
-}
-
-// Pause pauses playback on whichever device is currently active.
-func (s *SpotifyClient) Pause() error {
-	err := s.do("PUT", "/me/player/pause", nil, nil)
-	// 403 typically means already paused — benign
-	if err != nil && strings.Contains(err.Error(), "403") {
-		return nil
-	}
-	return err
-}
-
-// DeviceVolume returns the active device's volume (0-100), or -1 if unknown.
-func (s *SpotifyClient) DeviceVolume() (int, error) {
-	st, err := s.PlaybackStatus()
-	if err != nil {
-		return -1, err
-	}
-	if st == nil || st.Raw204 || st.DeviceID == "" {
-		return -1, nil
-	}
-	return st.VolumePercent, nil
-}
-
-// SetVolume sets the active device's volume (0-100). Not all devices support
-// this — Bluetooth speakers in particular may reject it.
-func (s *SpotifyClient) SetVolume(pct int) error {
-	if pct < 0 {
-		pct = 0
-	}
-	if pct > 100 {
-		pct = 100
-	}
-	return s.do("PUT", "/me/player/volume?volume_percent="+strconv.Itoa(pct), nil, nil)
 }

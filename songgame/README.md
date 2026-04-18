@@ -2,7 +2,7 @@
 
 A local web server that runs a family "guess that song" game. You drive the
 music from Spotify however you like — phone, laptop, Connect speaker — and the
-server just reads what's playing and does play / pause / skip between rounds.
+server just reads what's playing and skips between rounds.
 
 ## How it works
 
@@ -12,17 +12,16 @@ server just reads what's playing and does play / pause / skip between rounds.
 - **Players** open the root URL (e.g. `http://<your-laptop-ip>:8080/`) on their
   phones, enter a name, and wait.
 - **You** open `/admin`, log in with Spotify once, and click "Start next
-  round". The server calls *skip → resume → read currently-playing*, records
-  the track as the round's answer, and opens guessing for the players.
+  round". The server calls *skip → read currently-playing*, records the track
+  as the round's answer, and opens guessing for the players.
 - Players submit song + artist guesses. Once half have answered, a **30-second
   grace period** starts so the slower half can still guess. The round ends
   when the grace period expires, everyone has answered, or you click "End
   round now".
-- When the round ends, the server **ducks Spotify's volume** to a background
-  level (the song keeps playing) and reveals the answer. **30 seconds later
-  the next round auto-starts** — volume is restored, Spotify skips to a new
-  track, and a fresh round opens. You can also click "Start next round" to
-  skip the results countdown.
+- When the round ends, the server reveals the answer while the song keeps
+  playing. **30 seconds later the next round auto-starts** — Spotify skips to
+  a new track and a fresh round opens. You can also click "Start next round"
+  to skip the results countdown.
 - Scoring: 1 point for the correct song, 1 for the artist.
 - The player page **never** shows the currently-playing song or artist. The
   answer is only visible on `/admin`. Keep Spotify out of sight of players.
@@ -104,21 +103,21 @@ If the round's expected track drifts from what's actually playing (e.g. you
 transferred Spotify Connect to a different device, or the API lagged when the
 round was opened), the admin page has tools to recover:
 
-- The **Spotify playback state** card polls `/me/player` every few seconds
-  and shows the active device, volume, play/pause state, shuffle flag, and
-  the track Spotify *thinks* is playing with progress. If that track doesn't
-  match the round's expected track you'll see a red mismatch warning.
+- The **Spotify playback state** card polls `/me/player/currently-playing`
+  every few seconds and shows the active device and the track Spotify
+  *thinks* is playing. If that track doesn't match the round's expected
+  track you'll see a red mismatch warning.
 - Rounds follow an explicit three-phase lifecycle:
-  1. **Prep**: the admin kicked off a new round; the server has issued
-     skip/play and is polling Spotify at ~1 Hz until currently-playing
-     confirms a fresh track. Players see "Getting round N ready…" and no
-     guessing form. Round 1 doesn't issue a skip — prep just captures
-     whatever's playing.
+  1. **Prep**: the admin kicked off a new round; the server has issued a
+     skip and is polling Spotify at ~1 Hz until currently-playing confirms
+     a fresh track. Players see "Getting round N ready…" and no guessing
+     form. Round 1 doesn't issue a skip — prep just captures whatever's
+     playing.
   2. **Active**: confirmed track, players see the form, grace period logic
      applies. The poller drops to every 30 s but resyncs *immediately* on
      any mismatch (no two-poll delay).
-  3. **Ended**: reveal shown, volume ducked, auto-advance timer runs; when
-     it fires, the server skips and the next prep begins.
+  3. **Ended**: reveal shown, auto-advance timer runs; when it fires, the
+     server skips and the next prep begins.
   No player display ever shows a round the server isn't sure about.
 - The **Resync with Spotify** button forces the same reconciliation on
   demand — use it if you don't want to wait for auto-resync to kick in.
@@ -151,8 +150,5 @@ any). Their presence in already-archived games isn't affected.
 - Spotify's `currently-playing` endpoint can be a second or two stale after a
   skip; the server polls for up to ~4s to catch the new track.
 - If Spotify isn't actively playing when you click "Start next round", the
-  skip/play call fails — the admin page will show the error, and you just
-  need to nudge play on your phone and try again.
-- Volume ducking relies on Spotify Connect volume control, which doesn't work
-  on every device (Bluetooth speakers in particular may ignore it). If it
-  silently fails, the song just keeps playing at normal volume during results.
+  skip call fails — the admin page will show the error, and you just need
+  to nudge play on your phone and try again.
