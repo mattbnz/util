@@ -26,10 +26,6 @@ type ServerConfig struct {
 	BaseURL      string // e.g. http://127.0.0.1:8080 — used to print the shareable admin URL
 }
 
-// Volume to drop to during the results period. 30% is a "background" level
-// on most devices — still audible, but quiet enough to talk over.
-const duckedPercent = 30
-
 type Server struct {
 	cfg     ServerConfig
 	spotify *SpotifyClient
@@ -40,19 +36,17 @@ type Server struct {
 	oauthState string
 	adminToken string
 
-	volMu         sync.Mutex
-	preDuckVolume int // 0 = not ducked; otherwise the volume we should restore to
-
 	// Shared playback-state cache. A single background poller fills this in
 	// adaptively; both /admin/spotify-status and the auto-resync logic read
-	// from here, so we don't hammer /me/player with concurrent callers.
+	// from here, so we don't hammer /me/player/currently-playing with
+	// concurrent callers.
 	cacheMu    sync.RWMutex
 	cache      playbackCache
 	wakePoller chan struct{}
 }
 
 type playbackCache struct {
-	status   *PlaybackStatus
+	status   *CurrentlyPlaying
 	err      error
 	polledAt time.Time
 }
@@ -70,7 +64,7 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	s.adminToken = randomHex(16)
 	s.wakePoller = make(chan struct{}, 1)
-	s.game.SetCallbacks(s.onRoundEnd, s.onAutoAdvance)
+	s.game.SetCallbacks(nil, s.onAutoAdvance)
 	return s
 }
 
@@ -122,46 +116,10 @@ func (s *Server) RestoreState(snap StateSnapshot) {
 	s.spotify.LoadRefreshToken(snap.SpotifyRefreshToken)
 }
 
-func (s *Server) onRoundEnd() {
-	s.duckVolume()
-}
-
 func (s *Server) onAutoAdvance() {
 	if err := s.advanceToNextRound(); err != nil {
 		log.Printf("auto-advance: %v", err)
 	}
-}
-
-func (s *Server) duckVolume() {
-	s.volMu.Lock()
-	defer s.volMu.Unlock()
-	if s.preDuckVolume > 0 {
-		return // already ducked
-	}
-	vol, err := s.spotify.DeviceVolume()
-	if err != nil || vol < 0 {
-		return
-	}
-	if vol <= duckedPercent {
-		return // already quiet enough
-	}
-	if err := s.spotify.SetVolume(duckedPercent); err != nil {
-		log.Printf("duck volume: %v", err)
-		return
-	}
-	s.preDuckVolume = vol
-}
-
-func (s *Server) unduckVolume() {
-	s.volMu.Lock()
-	defer s.volMu.Unlock()
-	if s.preDuckVolume == 0 {
-		return
-	}
-	if err := s.spotify.SetVolume(s.preDuckVolume); err != nil {
-		log.Printf("restore volume: %v", err)
-	}
-	s.preDuckVolume = 0
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -423,19 +381,19 @@ func (s *Server) PokePlaybackPoller() {
 	}
 }
 
-// LastPlaybackStatus returns the most recently cached Spotify playback state
-// along with the time of the poll and any error recorded.
-func (s *Server) LastPlaybackStatus() (*PlaybackStatus, time.Time, error) {
+// LastPlaybackStatus returns the most recently cached currently-playing
+// response along with the time of the poll and any error recorded.
+func (s *Server) LastPlaybackStatus() (*CurrentlyPlaying, time.Time, error) {
 	s.cacheMu.RLock()
 	defer s.cacheMu.RUnlock()
 	return s.cache.status, s.cache.polledAt, s.cache.err
 }
 
-// RunPlaybackPoller is the single source of /me/player traffic. It caches the
-// last status for the admin UI to read, drives the prep→active transition
-// when a round is being set up, and fires immediate resyncs when an active
-// round drifts from what Spotify is playing. Cadence adapts to the current
-// phase (see pollPrep / pollInSync / pollIdle constants).
+// RunPlaybackPoller is the single source of /me/player/currently-playing
+// traffic. It caches the last status for the admin UI to read, drives the
+// prep→active transition when a round is being set up, and fires immediate
+// resyncs when an active round drifts from what Spotify is playing. Cadence
+// adapts to the current phase (see pollPrep / pollInSync / pollIdle constants).
 //
 // Blocks until stop is closed.
 func (s *Server) RunPlaybackPoller(stop <-chan struct{}) {
@@ -456,9 +414,9 @@ func (s *Server) RunPlaybackPoller(stop <-chan struct{}) {
 			interval = pollIdle
 			continue
 		}
-		st, err := s.spotify.PlaybackStatus()
+		cp, err := s.spotify.CurrentlyPlaying()
 		s.cacheMu.Lock()
-		s.cache = playbackCache{status: st, err: err, polledAt: time.Now()}
+		s.cache = playbackCache{status: cp, err: err, polledAt: time.Now()}
 		s.cacheMu.Unlock()
 		if err != nil {
 			// transient network / API hiccup — back off briefly and retry
@@ -468,7 +426,7 @@ func (s *Server) RunPlaybackPoller(stop <-chan struct{}) {
 		switch phase {
 		case PhasePrep:
 			interval = pollPrep
-			if st == nil || st.Raw204 || st.TrackURI == "" {
+			if cp == nil || cp.Item == nil || cp.Item.URI == "" {
 				// nothing playing yet — if we've been trying too long, give up
 				if s.prepTimedOut() {
 					s.game.CancelPrepRound()
@@ -478,7 +436,7 @@ func (s *Server) RunPlaybackPoller(stop <-chan struct{}) {
 				continue
 			}
 			prev := s.game.PrepPrevURI()
-			if prev != "" && st.TrackURI == prev {
+			if prev != "" && cp.Item.URI == prev {
 				// skip hasn't taken effect yet; keep waiting
 				if s.prepTimedOut() {
 					s.game.CancelPrepRound()
@@ -488,22 +446,20 @@ func (s *Server) RunPlaybackPoller(stop <-chan struct{}) {
 				continue
 			}
 			// Got a fresh track — activate.
-			if track, ok := st.AsTrack(); ok {
-				s.game.ActivateRound(track)
-				log.Printf("prep→active: %q by %v", track.Name, track.ArtistNames())
-				interval = pollInSync
-			}
+			track := *cp.Item
+			s.game.ActivateRound(track)
+			log.Printf("prep→active: %q by %v", track.Name, track.ArtistNames())
+			interval = pollInSync
 		case PhaseActive:
 			interval = pollInSync
 			expected := s.game.CurrentTrackURI()
-			if st == nil || st.Raw204 || st.TrackURI == "" || st.TrackURI == expected {
+			if cp == nil || cp.Item == nil || cp.Item.URI == "" || cp.Item.URI == expected {
 				continue
 			}
 			// Immediate resync — user asked for no delay.
-			if track, ok := st.AsTrack(); ok {
-				if s.game.UpdateRoundTrack(track) {
-					log.Printf("auto-resync: round track updated to %q by %v", track.Name, track.ArtistNames())
-				}
+			track := *cp.Item
+			if s.game.UpdateRoundTrack(track) {
+				log.Printf("auto-resync: round track updated to %q by %v", track.Name, track.ArtistNames())
 			}
 		}
 	}
@@ -526,18 +482,39 @@ func (s *Server) handleSpotifyStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	type resp struct {
-		Status         *PlaybackStatus `json:"status"`
-		Error          string          `json:"error,omitempty"`
-		PolledAt       int64           `json:"polled_at,omitempty"`
-		AgeSeconds     int             `json:"age_seconds,omitempty"`
-		RoundActive    bool            `json:"round_active"`
-		RoundTrackURI  string          `json:"round_track_uri"`
-		RoundTrackName string          `json:"round_track_name"`
-		Mismatch       bool            `json:"mismatch"`
+	type statusOut struct {
+		IsPlaying    bool     `json:"is_playing"`
+		DeviceName   string   `json:"device_name,omitempty"`
+		DeviceType   string   `json:"device_type,omitempty"`
+		TrackURI     string   `json:"track_uri,omitempty"`
+		TrackName    string   `json:"track_name,omitempty"`
+		TrackArtists []string `json:"track_artists,omitempty"`
 	}
-	st, at, err := s.LastPlaybackStatus()
-	out := resp{Status: st}
+	type resp struct {
+		Status         *statusOut `json:"status"`
+		Error          string     `json:"error,omitempty"`
+		PolledAt       int64      `json:"polled_at,omitempty"`
+		AgeSeconds     int        `json:"age_seconds,omitempty"`
+		RoundActive    bool       `json:"round_active"`
+		RoundTrackURI  string     `json:"round_track_uri"`
+		RoundTrackName string     `json:"round_track_name"`
+		Mismatch       bool       `json:"mismatch"`
+	}
+	cp, at, err := s.LastPlaybackStatus()
+	out := resp{}
+	if cp != nil {
+		st := &statusOut{IsPlaying: cp.IsPlaying}
+		if cp.Device != nil {
+			st.DeviceName = cp.Device.Name
+			st.DeviceType = cp.Device.Type
+		}
+		if cp.Item != nil {
+			st.TrackURI = cp.Item.URI
+			st.TrackName = cp.Item.Name
+			st.TrackArtists = cp.Item.ArtistNames()
+		}
+		out.Status = st
+	}
 	if !at.IsZero() {
 		out.PolledAt = at.Unix()
 		out.AgeSeconds = int(time.Since(at).Seconds())
@@ -628,26 +605,23 @@ func (s *Server) handleEndRound(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	s.game.EndRound() // callbacks handle ducking playback
+	s.game.EndRound()
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
-// advanceToNextRound begins the next round. It un-ducks volume, issues a skip
-// only if a previous round exists (round 1 keeps whatever is playing), starts
-// playback, and opens a prep-phase round. The playback poller then watches
-// /me/player until the track URI differs from the prev round's (or any track
-// appears for round 1) and flips the round to active. Players don't see the
-// round until that transition happens.
+// advanceToNextRound begins the next round. It issues a skip only if a
+// previous round exists (round 1 keeps whatever is playing) and opens a
+// prep-phase round. The playback poller then watches
+// /me/player/currently-playing until the track URI differs from the prev
+// round's (or any track appears for round 1) and flips the round to active.
+// Players don't see the round until that transition happens. For round 1 the
+// host is expected to already have Spotify playing on a device.
 func (s *Server) advanceToNextRound() error {
-	s.unduckVolume()
 	prevURI := s.game.CurrentTrackURI() // non-empty only if a completed round is still around
 	if prevURI != "" {
 		if err := s.spotify.Next(); err != nil {
 			return fmt.Errorf("couldn't skip to the next song: %v — make sure Spotify is open and playing on a device", err)
 		}
-	}
-	if err := s.spotify.Play(); err != nil {
-		return fmt.Errorf("couldn't start playback: %v — open Spotify, start your playlist (shuffle recommended), then try again", err)
 	}
 	s.game.BeginPrepRound(prevURI)
 	s.PokePlaybackPoller()

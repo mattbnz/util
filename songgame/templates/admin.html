@@ -287,13 +287,8 @@
   };
   es.onerror = function(){ setTimeout(function(){ if (last === null) location.reload(); }, 5000); };
 
-  // Spotify status poller — refreshes every 4 seconds to surface device/state
-  // info and warn when Spotify is playing a track different from the round.
-  function fmtMS(ms){
-    if (!ms || ms < 0) ms = 0;
-    var s = Math.floor(ms/1000);
-    return Math.floor(s/60) + ":" + String(s%60).padStart(2,'0');
-  }
+  // Spotify status poller — refreshes every 4 seconds to surface what Spotify
+  // reports as currently-playing and warn when it differs from the round.
   function renderStatus(r){
     var line = document.getElementById('spotifyStatusLine');
     var warn = document.getElementById('spotifyMismatch');
@@ -304,9 +299,9 @@
       return;
     }
     var s = r.status;
-    if (!s || s.raw_204 || !s.device_id) {
+    if (!s || !s.track_uri) {
       if (r.polled_at) {
-        line.innerHTML = '<em>No active Spotify device reported.</em> Open Spotify on your phone or laptop and start playing.';
+        line.innerHTML = '<em>Nothing currently playing.</em> Open Spotify on your phone or laptop and start playing.';
       } else {
         line.innerHTML = '<em>Waiting for first playback poll…</em> (the poller idles when no round is active)';
       }
@@ -314,11 +309,13 @@
       return;
     }
     var bits = [];
-    bits.push('<strong>' + (s.device_name || '?') + '</strong> <span class="muted">(' + (s.device_type || '?') + ', vol ' + (s.volume_percent||0) + '%'+ (s.is_playing ? ', playing' : ', paused') + (s.shuffle ? ', shuffle' : '') + ')</span>');
-    if (s.track_name) {
-      var artists = (s.track_artists || []).join(', ');
-      bits.push('<br>Spotify: <strong>' + s.track_name + '</strong> — ' + artists + ' <span class="muted">(' + fmtMS(s.progress_ms) + ' / ' + fmtMS(s.duration_ms) + ')</span>');
+    if (s.device_name) {
+      bits.push('<strong>' + s.device_name + '</strong> <span class="muted">(' + (s.device_type || '?') + (s.is_playing ? ', playing' : ', paused') + ')</span>');
+    } else {
+      bits.push(s.is_playing ? 'Playing' : 'Paused');
     }
+    var artists = (s.track_artists || []).join(', ');
+    bits.push('<br>Spotify: <strong>' + s.track_name + '</strong> — ' + artists);
     if (r.age_seconds >= 0) {
       bits.push(' <span class="muted" style="font-size:0.8rem;">(last polled ' + r.age_seconds + 's ago)</span>');
     }
