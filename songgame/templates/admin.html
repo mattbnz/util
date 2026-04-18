@@ -146,6 +146,27 @@
         </table>
       </div>
     </div>
+
+    {{with .PrevRound}}
+    <div class="card">
+      <h3 style="margin-top:0">Round {{.Number}} results</h3>
+      <p class="muted" style="margin-top:0">The song was <strong>{{.Song}}</strong> by <strong>{{.Artists}}</strong>.</p>
+      {{if .Answers}}
+      <table>
+        <tr><th>Player</th><th>Song guess</th><th>Artist guess</th></tr>
+        {{range .Answers}}
+        <tr>
+          <td>{{.PlayerName}}</td>
+          <td>{{.SongGuess}} {{if .SongCorrect}}<span class="mark-ok">✓</span>{{else}}<span class="mark-no">✗</span>{{end}}</td>
+          <td>{{.ArtistGuess}} {{if .ArtistCorrect}}<span class="mark-ok">✓</span>{{else}}<span class="mark-no">✗</span>{{end}}</td>
+        </tr>
+        {{end}}
+      </table>
+      {{else}}
+      <p class="muted">Nobody answered.</p>
+      {{end}}
+    </div>
+    {{end}}
     {{end}}
   {{end}}
 

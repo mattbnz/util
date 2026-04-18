@@ -104,6 +104,35 @@ func TestStartRoundCancelsAutoAdvanceTimer(t *testing.T) {
 	}
 }
 
+func TestPrevRoundCapturedOnEndAndPersistsIntoNextRound(t *testing.T) {
+	g := NewGame()
+	g.AddOrUpdatePlayer("a", "Alice")
+	g.AddOrUpdatePlayer("b", "Bob")
+
+	g.StartRound(track("t1", "Imagine", "John Lennon"))
+	g.SubmitAnswer("a", "Imagine", "John Lennon")
+	g.SubmitAnswer("b", "wrong", "wrong")
+
+	// Everyone answered → round ends immediately; prev round snapshot populated
+	v := g.PlayerView("a")
+	if v.PrevRound == nil {
+		t.Fatalf("PrevRound should be populated after round ends")
+	}
+	if v.PrevRound.Number != 1 || v.PrevRound.Song != "Imagine" {
+		t.Fatalf("unexpected prev round: %+v", v.PrevRound)
+	}
+	if n := len(v.PrevRound.Answers); n != 2 {
+		t.Fatalf("expected 2 answers, got %d", n)
+	}
+
+	// Start the next round; prev round should still be visible.
+	g.StartRound(track("t2", "Yesterday", "The Beatles"))
+	v = g.PlayerView("a")
+	if v.PrevRound == nil || v.PrevRound.Number != 1 {
+		t.Fatalf("PrevRound should still reference round 1 during round 2, got %+v", v.PrevRound)
+	}
+}
+
 func TestGraceUntilClearsOnRoundEnd(t *testing.T) {
 	g := NewGame()
 	g.AddOrUpdatePlayer("a", "A")

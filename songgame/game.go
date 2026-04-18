@@ -44,12 +44,22 @@ type Round struct {
 	AutoAdvanceAt time.Time // set on end; next round auto-starts at this time
 }
 
+// RoundResult is the persisted snapshot of a completed round, shown below the
+// scoreboard so players can see how everyone guessed.
+type RoundResult struct {
+	Number  int       `json:"number"`
+	Song    string    `json:"song"`
+	Artists string    `json:"artists"`
+	Answers []*Answer `json:"answers"`
+}
+
 type Game struct {
 	mu sync.Mutex
 
-	Round   *Round
-	Players map[string]*Player
-	Number  int
+	Round     *Round
+	PrevRound *RoundResult
+	Players   map[string]*Player
+	Number    int
 
 	graceDuration   time.Duration
 	resultsDuration time.Duration
@@ -160,10 +170,11 @@ func (g *Game) notify() {
 // persisted — on restart we resume with scores and players intact but no
 // active round.
 type StateSnapshot struct {
-	Players          []Player `json:"players"`
-	RoundNumber      int      `json:"round_number"`
-	GraceDurationS   int      `json:"grace_duration_s"`
-	ResultsDurationS int      `json:"results_duration_s"`
+	Players          []Player     `json:"players"`
+	RoundNumber      int          `json:"round_number"`
+	GraceDurationS   int          `json:"grace_duration_s"`
+	ResultsDurationS int          `json:"results_duration_s"`
+	PrevRound        *RoundResult `json:"prev_round,omitempty"`
 }
 
 func (g *Game) Snapshot() StateSnapshot {
@@ -178,6 +189,7 @@ func (g *Game) Snapshot() StateSnapshot {
 		RoundNumber:      g.Number,
 		GraceDurationS:   int(g.graceDuration / time.Second),
 		ResultsDurationS: int(g.resultsDuration / time.Second),
+		PrevRound:        g.PrevRound,
 	}
 }
 
@@ -200,6 +212,9 @@ func (g *Game) Restore(s StateSnapshot) {
 		}
 		pp := p
 		g.Players[p.ID] = &pp
+	}
+	if s.PrevRound != nil {
+		g.PrevRound = s.PrevRound
 	}
 }
 
@@ -371,6 +386,21 @@ func (g *Game) endRoundLocked() {
 			p.Score++
 		}
 	}
+	// Capture a persistent snapshot of this round's answers so players can see
+	// everyone's guesses below the scoreboard — including after the next round starts.
+	result := &RoundResult{
+		Number:  g.Round.Number,
+		Song:    g.Round.Track.Name,
+		Artists: joinArtists(g.Round.Track.ArtistNames()),
+	}
+	for _, a := range g.Round.Answers {
+		ac := *a
+		result.Answers = append(result.Answers, &ac)
+	}
+	sort.Slice(result.Answers, func(i, j int) bool {
+		return result.Answers[i].SubmittedAt.Before(result.Answers[j].SubmittedAt)
+	})
+	g.PrevRound = result
 	if g.onAutoAdvance != nil {
 		g.autoAdvanceTimer = time.AfterFunc(g.resultsDuration, g.onAutoAdvance)
 	}
@@ -382,22 +412,23 @@ func (g *Game) endRoundLocked() {
 // --- state snapshots for rendering/SSE ---
 
 type PlayerView struct {
-	RoundNumber      int       `json:"round_number"`
-	RoundActive      bool      `json:"round_active"`
-	RoundEnded       bool      `json:"round_ended"`
-	HasAnswered      bool      `json:"has_answered"`
-	YourSongOK       bool      `json:"your_song_ok"`
-	YourArtistOK     bool      `json:"your_artist_ok"`
-	YourSongGuess    string    `json:"your_song_guess"`
-	YourArtistGuess  string    `json:"your_artist_guess"`
-	AnswerCount      int       `json:"answer_count"`
-	PlayerCount      int       `json:"player_count"`
-	GraceUntilUnix   int64     `json:"grace_until,omitempty"`
-	AutoAdvanceUnix  int64     `json:"auto_advance_at,omitempty"`
-	RevealSong       string    `json:"reveal_song,omitempty"`
-	RevealArtists    string    `json:"reveal_artists,omitempty"`
-	Scoreboard       []*Player `json:"scoreboard"`
-	You              *Player   `json:"you"`
+	RoundNumber     int          `json:"round_number"`
+	RoundActive     bool         `json:"round_active"`
+	RoundEnded      bool         `json:"round_ended"`
+	HasAnswered     bool         `json:"has_answered"`
+	YourSongOK      bool         `json:"your_song_ok"`
+	YourArtistOK    bool         `json:"your_artist_ok"`
+	YourSongGuess   string       `json:"your_song_guess"`
+	YourArtistGuess string       `json:"your_artist_guess"`
+	AnswerCount     int          `json:"answer_count"`
+	PlayerCount     int          `json:"player_count"`
+	GraceUntilUnix  int64        `json:"grace_until,omitempty"`
+	AutoAdvanceUnix int64        `json:"auto_advance_at,omitempty"`
+	RevealSong      string       `json:"reveal_song,omitempty"`
+	RevealArtists   string       `json:"reveal_artists,omitempty"`
+	Scoreboard      []*Player    `json:"scoreboard"`
+	You             *Player      `json:"you"`
+	PrevRound       *RoundResult `json:"prev_round,omitempty"`
 }
 
 func (g *Game) PlayerView(playerID string) PlayerView {
@@ -433,22 +464,24 @@ func (g *Game) PlayerView(playerID string) PlayerView {
 		}
 	}
 	v.Scoreboard = g.playerListLocked()
+	v.PrevRound = g.PrevRound
 	return v
 }
 
 type AdminView struct {
-	Authorized      bool      `json:"authorized"`
-	RoundNumber     int       `json:"round_number"`
-	RoundActive     bool      `json:"round_active"`
-	RoundEnded      bool      `json:"round_ended"`
-	CurrentSong     string    `json:"current_song"`
-	CurrentArtists  string    `json:"current_artists"`
-	AnswerCount     int       `json:"answer_count"`
-	PlayerCount     int       `json:"player_count"`
-	GraceUntilUnix  int64     `json:"grace_until,omitempty"`
-	AutoAdvanceUnix int64     `json:"auto_advance_at,omitempty"`
-	Answers         []*Answer `json:"answers"`
-	Scoreboard      []*Player `json:"scoreboard"`
+	Authorized      bool         `json:"authorized"`
+	RoundNumber     int          `json:"round_number"`
+	RoundActive     bool         `json:"round_active"`
+	RoundEnded      bool         `json:"round_ended"`
+	CurrentSong     string       `json:"current_song"`
+	CurrentArtists  string       `json:"current_artists"`
+	AnswerCount     int          `json:"answer_count"`
+	PlayerCount     int          `json:"player_count"`
+	GraceUntilUnix  int64        `json:"grace_until,omitempty"`
+	AutoAdvanceUnix int64        `json:"auto_advance_at,omitempty"`
+	Answers         []*Answer    `json:"answers"`
+	Scoreboard      []*Player    `json:"scoreboard"`
+	PrevRound       *RoundResult `json:"prev_round,omitempty"`
 }
 
 func (g *Game) AdminView() AdminView {
@@ -477,6 +510,7 @@ func (g *Game) AdminView() AdminView {
 		})
 	}
 	v.Scoreboard = g.playerListLocked()
+	v.PrevRound = g.PrevRound
 	return v
 }
 
